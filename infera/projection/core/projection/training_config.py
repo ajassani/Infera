@@ -1294,9 +1294,14 @@ def megatron_derive_default_args(args):
     args.sequence_length = args.seq_length
     args.context_model_parallel_size = args.context_parallel_size
 
-    # Use model's vocab size if set, otherwise default to 100352
-    if not hasattr(args, "padded_vocab_size") or args.padded_vocab_size is None:
-        args.padded_vocab_size = 100352
+    # ``vocab_size`` is the HF/yaml field; ``padded_vocab_size`` is what the
+    # embedding profiler reads. Forcing 100352 whenever padded is unset made
+    # every Qwen/Llama preset (vocab 128k-152k, yaml leaves padded null)
+    # under-count the table by tens of millions of params.
+    padded = getattr(args, "padded_vocab_size", None)
+    if padded in (None, 0):
+        vocab = getattr(args, "vocab_size", None)
+        args.padded_vocab_size = int(vocab) if vocab else 100352
 
     return args
 

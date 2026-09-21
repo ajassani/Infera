@@ -15,7 +15,16 @@ from __future__ import annotations
 
 import pytest
 
-from infera.projection.core.projection.training_config import dtype_num_bytes
+from infera.projection.core.projection.inference_projection.memory import (
+    project_inference_memory,
+)
+from infera.projection.core.projection.training_config import (
+    InferenceConfig,
+    InferenceRequestConfig,
+    ModelConfig,
+    ModelParallelConfig,
+    dtype_num_bytes,
+)
 
 GIB = 1024.0 ** 3
 
@@ -39,6 +48,33 @@ def test_mxfp4_is_a_quarter_of_bf16():
 
 
 from .conftest import project_spec as _project
+
+
+def _qwen05(*, share: bool) -> InferenceConfig:
+    """Qwen2.5-0.5B geometry; LN/MLP counts are whatever the profiler uses today."""
+    return InferenceConfig(
+        model_config=ModelConfig(
+            num_layers=24,
+            hidden_size=896,
+            num_attention_heads=14,
+            num_query_groups=2,
+            group_query_attention=True,
+            kv_channels=64,
+            ffn_hidden_size=4864,
+            padded_vocab_size=151936,
+            swiglu=True,
+            moe_pattern=[False] * 24,
+            share_embeddings_and_output_weights=share,
+        ),
+        request_config=InferenceRequestConfig(
+            weight_dtype="bf16",
+            kv_cache_dtype="bf16",
+            batch_size=1,
+            max_concurrency=1,
+            max_context_len=2048,
+        ),
+        model_parallel_config=ModelParallelConfig(tensor_model_parallel_size=1),
+    )
 
 
 def test_weights_are_tp_sharded_across_ranks():
@@ -135,3 +171,93 @@ def test_long_context_prefill_respects_the_token_budget():
     )
     assert out["sustainable_concurrency"] > 0, "activation blow-up starved the KV cache"
     assert out["memory_gb"] < 288.0
+
+
+def test_tied_embeddings_are_not_double_counted_on_pp1():
+    """share_embeddings_and_output_weights must drop the extra vocab table on PP=1.
+
+    The flag was already derived from ``untie_embeddings_and_output_weights``
+    and copied onto ModelConfig; estimated_num_params ignored it and always
+    added embedding + output_layer. Qwen2.5-0.5B (tied, 152k vocab) was
+    charged 0.538B params vs the 0.494B checkpoint.
+    """
+    tied = project_inference_memory(_qwen05(share=True), verbose=False)
+    untied = project_inference_memory(_qwen05(share=False), verbose=False)
+    vocab_table = 151936 * 896
+    assert untied.num_params - tied.num_params == vocab_table
+    assert tied.num_params > vocab_table
+
+
+def test_tied_embeddings_keep_last_stage_copy_under_pp():
+    """Megatron duplicates the tied table on the last pipeline stage."""
+    import os
+    from dataclasses import replace
+
+    cfg = _qwen05(share=True)
+    cfg = replace(
+        cfg,
+        model_parallel_config=replace(
+            cfg.model_parallel_config, pipeline_model_parallel_size=2
+        ),
+    )
+    prev = os.environ.get("RANK")
+    try:
+        os.environ["RANK"] = "0"
+        first = project_inference_memory(cfg, rank=0, verbose=False)
+        os.environ["RANK"] = "1"
+        last = project_inference_memory(cfg, rank=1, verbose=False)
+    finally:
+        if prev is None:
+            os.environ.pop("RANK", None)
+        else:
+            os.environ["RANK"] = prev
+    vocab_table = 151936 * 896
+    assert first.num_params >= vocab_table
+    assert last.num_params >= vocab_table
+
+
+def test_vocab_size_fills_padded_vocab_when_unset():
+    """yaml vocab_size is the real table width; 100352 is only the gpt-oss fallback."""
+    from types import SimpleNamespace
+
+    from infera.projection.core.projection.training_config import (
+        megatron_derive_default_args,
+    )
+
+    args = SimpleNamespace(
+        kv_channels=None,
+        hidden_size=896,
+        num_attention_heads=14,
+        group_query_attention=True,
+        num_query_groups=2,
+        untie_embeddings_and_output_weights=False,
+        num_experts=None,
+        num_layers=24,
+        seq_length=2048,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        vocab_size=151936,
+        padded_vocab_size=None,
+    )
+    out = megatron_derive_default_args(args)
+    assert out.padded_vocab_size == 151936
+
+    fallback = SimpleNamespace(
+        kv_channels=None,
+        hidden_size=2880,
+        num_attention_heads=64,
+        group_query_attention=True,
+        num_query_groups=8,
+        untie_embeddings_and_output_weights=True,
+        num_experts=None,
+        num_layers=36,
+        seq_length=4096,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        vocab_size=None,
+        padded_vocab_size=None,
+    )
+    out = megatron_derive_default_args(fallback)
+    assert out.padded_vocab_size == 100352
