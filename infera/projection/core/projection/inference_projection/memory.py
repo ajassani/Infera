@@ -61,36 +61,39 @@ def _layers_on_rank(inference_config: InferenceConfig) -> int:
     return max(1, (mc.num_layers + pp - 1) // pp)
 
 
-def _forward_activation_bytes(inference_config: InferenceConfig, profiler) -> int:
-    """A bounded estimate of the transient forward activation working set.
+def _forward_activation_bytes(inference_config: InferenceConfig) -> int:
+    """Transient HBM for one serving scheduler step.
 
-    Inference keeps no activations for backward, so only a few in-flight
-    layers' worth of hidden states exist at once.  We proxy this with one
-    transformer layer's activation footprint at the prefill token count,
-    scaled by a small number of in-flight layers.
+    Training ``estimated_activation_memory`` keeps SwiGLU gate+up+act for
+    backward and an ``S×S`` score tensor. Fused/paged attention does not
+    write scores to global memory, and inference does not store activations
+    for backward. Leftover KV must not pay those.
+
+    The working set is the engine's step token budget (vLLM
+    ``--max-num-batched-tokens``), not resident ISL and not ``batch × seq``
+    folded into one giant sequence.
     """
     req = inference_config.request_config
     batch = max(1, req.batch_size)
-    # The working set is one scheduler step's worth of tokens. The engine's
-    # prefill budget (vLLM --max-num-batched-tokens / SGLang
-    # --chunked-prefill-size) caps that step across the WHOLE batch, not per
-    # sequence, so it bounds the product rather than one sequence's prompt.
     tokens = batch * req.input_seq_len
     budget = int(req.max_num_batched_tokens or 0) or int(req.chunked_prefill_size or 0)
     if budget > 0:
         tokens = min(tokens, budget)
 
-    layer = profiler.sub_profilers.get("dense_transformer_layer")
-    moe_layer = profiler.sub_profilers.get("moe_transformer_layer")
-    chosen = layer
-    # Prefer whichever layer type actually exists in the model.
-    if (inference_config.model_config.num_experts or 0) and moe_layer is not None:
-        chosen = moe_layer
-    if chosen is None:
-        return 0
-    per_layer = chosen.estimated_activation_memory(1, tokens)
-    inflight_layers = min(_layers_on_rank(inference_config), 2)
-    return int(per_layer * inflight_layers)
+    mc = inference_config.model_config
+    mp = inference_config.model_parallel_config
+    tp = max(1, mp.tensor_model_parallel_size)
+    cp = max(1, mp.context_model_parallel_size)
+    tokens_per_rank = max(1, tokens // tp // cp)
+
+    hidden = int(mc.hidden_size)
+    ffn = int(mc.ffn_hidden_size or 0) or hidden
+    if int(mc.num_experts or 0) > 0:
+        ffn = int(mc.moe_ffn_hidden_size or 0) or ffn
+        topk = max(1, int(mc.moe_router_topk or 1))
+        ffn = ffn * topk
+    # One live intermediate + hidden, bf16. Layer-at-a-time forward.
+    return int(tokens_per_rank * (hidden + ffn) * 2)
 
 
 def project_inference_memory(
@@ -158,7 +161,7 @@ def project_inference_memory(
 
     layers_on_rank = _layers_on_rank(inference_config)
     kv = estimate_kv_cache(inference_config, layers_on_rank)
-    activation_bytes = _forward_activation_bytes(inference_config, profiler)
+    activation_bytes = _forward_activation_bytes(inference_config)
 
     total = weight_bytes + int(kv.bytes_total) + activation_bytes
 

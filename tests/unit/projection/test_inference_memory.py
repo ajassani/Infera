@@ -296,3 +296,37 @@ def test_engine_reserved_is_subtracted_inside_the_usable_fraction():
         (with_res.total_bytes + with_res.engine_reserved_bytes)
         <= int(192.0 * GIB * 0.9)
     )
+
+
+def test_serving_activations_scale_with_step_tokens_not_seq_squared():
+    """Packed B sequences of S is B*S tokens, not one sequence of length B*S.
+
+    The training profiler billed an S×S score tensor in HBM. Serving flash /
+    paged attention does not write that tensor. Doubling the batch at fixed
+    seq must double activations, not square them.
+    """
+    from dataclasses import replace
+
+    def _at(*, batch: int, seq: int, budget: int = 0):
+        cfg = replace(
+            _qwen05(share=True),
+            request_config=replace(
+                _qwen05(share=True).request_config,
+                batch_size=batch,
+                input_seq_len=seq,
+                max_context_len=max(seq, 2048),
+                max_num_batched_tokens=budget,
+            ),
+        )
+        return project_inference_memory(cfg, verbose=False).activation_bytes
+
+    one = _at(batch=1, seq=2048)
+    wide = _at(batch=32, seq=2048)
+    assert wide == pytest.approx(32 * one, rel=1e-6)
+    # 32k-token step stays a working set, not tens of GiB of scores.
+    long = _at(batch=1, seq=32768)
+    assert long == pytest.approx(16 * one, rel=1e-6)
+    assert long < 1 * GIB
+    # Engine budget caps ISL, so AgentX-length prompts do not blow leftover.
+    capped = _at(batch=64, seq=131072, budget=8192)
+    assert capped == pytest.approx(_at(batch=1, seq=8192), rel=1e-6)
