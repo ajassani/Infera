@@ -365,6 +365,11 @@ class InferenceRequestConfig:
     # usable HBM for weights + KV + activations and therefore the max concurrent
     # sequences.  ``None`` = use the full HBM capacity (legacy behaviour).
     kv_cache_memory_fraction: Optional[float] = None
+    # Engine-resident bytes the serving runtime subtracts from the usable
+    # fraction *before* the KV pool (vLLM: profiled peak minus weights, i.e.
+    # HIP/allocator + dummy-forward). Distinct from ``1 - fraction``, which is
+    # extra headroom *outside* the 90%. ``0`` keeps legacy leftover.
+    engine_reserved_gb: float = 0.0
     # Paged-KV block (page) size in tokens.  Real serving engines allocate KV in
     # fixed-size blocks (vLLM ``block_size``, typically 16), so a sequence's
     # context is rounded UP to a whole number of blocks — the last partially

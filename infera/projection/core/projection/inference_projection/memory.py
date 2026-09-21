@@ -49,6 +49,7 @@ class InferenceMemoryResult:
     hbm_capacity_bytes: Optional[int] = None
     max_concurrent_sequences: Optional[int] = None
     fits: Optional[bool] = None
+    engine_reserved_bytes: int = 0
 
 
 _GB = 1024.0 ** 3
@@ -166,11 +167,14 @@ def project_inference_memory(
     fits = None
     if hbm_bytes is not None:
         # Serving engines only hand a fraction of HBM to the runtime (vLLM
-        # gpu_memory_utilization / SGLang mem_fraction_static); the rest is
-        # reserved for the driver/CUDA context and fragmentation headroom.
+        # gpu_memory_utilization / SGLang mem_fraction_static). That fraction
+        # is the *budget*; the engine still subtracts a profiled peak (weights
+        # + dummy forward + HIP/allocator) from it. ``1 - fraction`` is extra
+        # headroom outside the budget, not the CUDA context.
         fraction = inference_config.request_config.kv_cache_memory_fraction
         usable_bytes = int(hbm_bytes * float(fraction)) if fraction else hbm_bytes
-        free_for_kv = usable_bytes - weight_bytes - activation_bytes
+        reserved = int(max(0.0, inference_config.request_config.engine_reserved_gb) * _GB)
+        free_for_kv = usable_bytes - weight_bytes - activation_bytes - reserved
         # Blocks spilled to the host tier still hold a live session's context, so
         # they raise how many sessions a replica can keep resident even though
         # the actively-decoding batch stays in HBM. This is why the measured
@@ -178,7 +182,7 @@ def project_inference_memory(
         # the time, and idle KV does not need HBM bandwidth.
         free_for_kv += inference_config.request_config.kv_offload_gb_per_gpu * _GB
         max_conc = max_concurrent_sequences(inference_config, layers_on_rank, free_for_kv)
-        fits = total <= usable_bytes
+        fits = (total + reserved) <= usable_bytes
 
     result = InferenceMemoryResult(
         rank=eff_rank,
@@ -192,6 +196,7 @@ def project_inference_memory(
         hbm_capacity_bytes=hbm_bytes,
         max_concurrent_sequences=max_conc,
         fits=fits,
+        engine_reserved_bytes=reserved if hbm_bytes is not None else 0,
     )
 
     if verbose:
@@ -227,6 +232,8 @@ def _print_memory(inference_config: InferenceConfig, r: InferenceMemoryResult) -
             print(
                 f"  Usable HBM (frac={req.kv_cache_memory_fraction:.2f}): {usable / _GB:.4f} GB"
             )
+        if r.engine_reserved_bytes:
+            print(f"  Engine reserved:          {r.engine_reserved_bytes / _GB:.4f} GB")
         print(f"  Fits:                     {r.fits}")
         if req.kv_offload_gb_per_gpu:
             print(
