@@ -9,6 +9,7 @@ swiglu: true
 add_bias_linear: false
 attention_softmax_in_fp32: true
 untie_embeddings_and_output_weights: true
+vocab_size: 151936
 hidden_dropout: 0.0
 attention_dropout: 0.0
 

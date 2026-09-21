@@ -452,6 +452,11 @@ class LanguageModelProfiler(BaseModuleProfiler):
             total_params += self.sub_profilers["embedding"].estimated_num_params(rank)
         if self.config.model_config.num_layers - 1 in self.layers:
             total_params += self.sub_profilers["final_layernorm"].estimated_num_params(rank)
-            total_params += self.sub_profilers["output_layer"].estimated_num_params(rank)
+            # Tied embeddings: Megatron keeps the table on the first and last
+            # pipeline stages. PP=1 is the same rank, so adding output_layer
+            # here double-counts. PP>1 still needs the last-stage copy.
+            share = bool(self.config.model_config.share_embeddings_and_output_weights)
+            if not (share and 0 in self.layers):
+                total_params += self.sub_profilers["output_layer"].estimated_num_params(rank)
         return total_params
 
