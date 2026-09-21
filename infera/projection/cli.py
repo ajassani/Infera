@@ -483,6 +483,14 @@ def _add_inference_args(parser):
         "SGLang mem_fraction_static). Bounds usable HBM + max concurrency. Default: full HBM.",
     )
     parser.add_argument(
+        "--engine-reserved-gb",
+        type=float,
+        default=None,
+        help="HBM the serving runtime keeps inside the usable fraction besides "
+        "formula weights and activations (vLLM profiled peak minus weights: "
+        "HIP/allocator + dummy-forward). Subtracted from leftover KV. Default: 0.",
+    )
+    parser.add_argument(
         "--kv-block-size",
         type=int,
         default=None,

@@ -261,3 +261,38 @@ def test_vocab_size_fills_padded_vocab_when_unset():
     )
     out = megatron_derive_default_args(fallback)
     assert out.padded_vocab_size == 100352
+
+
+def test_engine_reserved_is_subtracted_inside_the_usable_fraction():
+    """vLLM carves KV from gpu_memory_utilization * HBM minus a profiled peak.
+
+    The unused (1 - fraction) is extra headroom, not that peak. A ~2 GB
+    reserved term must come out of leftover, not out of weight_bytes.
+    """
+    from dataclasses import replace
+
+    cfg = _qwen05(share=True)
+    cfg = replace(
+        cfg,
+        request_config=replace(
+            cfg.request_config,
+            kv_cache_memory_fraction=0.9,
+            max_num_batched_tokens=2048,
+        ),
+    )
+    none = project_inference_memory(cfg, hbm_capacity_gb=192.0, verbose=False)
+    reserved_cfg = replace(
+        cfg,
+        request_config=replace(cfg.request_config, engine_reserved_gb=2.0),
+    )
+    with_res = project_inference_memory(
+        reserved_cfg, hbm_capacity_gb=192.0, verbose=False
+    )
+    assert with_res.engine_reserved_bytes == int(2 * GIB)
+    assert with_res.weight_bytes == none.weight_bytes
+    assert with_res.max_concurrent_sequences < none.max_concurrent_sequences
+    # Fits must charge the reserved term against usable, not only weights+KV+act.
+    assert with_res.fits == (
+        (with_res.total_bytes + with_res.engine_reserved_bytes)
+        <= int(192.0 * GIB * 0.9)
+    )

@@ -45,6 +45,7 @@ _ARG_TO_FIELD = {
     "mixed_batch_penalty": "mixed_batch_penalty",
     "cudagraph_mode": "cudagraph_mode",
     "kv_cache_memory_fraction": "kv_cache_memory_fraction",
+    "engine_reserved_gb": "engine_reserved_gb",
     "kv_block_size": "kv_block_size",
     "kv_offload_gb_per_gpu": "kv_offload_gb_per_gpu",
     "kv_offload_bw_gbps": "kv_offload_bw_gbps",
@@ -183,6 +184,8 @@ def _print_performance(inference_config, perf, gpu_cost_per_hour=None) -> None:
         feats.append(f"cudagraph={req.cudagraph_mode}")
     if req.kv_cache_memory_fraction:
         feats.append(f"kv_mem_frac={req.kv_cache_memory_fraction:.2f}")
+    if req.engine_reserved_gb:
+        feats.append(f"engine_reserved={req.engine_reserved_gb:g}GB")
     if req.kv_block_size:
         feats.append(f"kv_block={req.kv_block_size}")
     if req.kv_offload_gb_per_gpu:
