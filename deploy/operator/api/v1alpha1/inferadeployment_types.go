@@ -88,10 +88,13 @@ type ServiceSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	NumberOfNodes int32 `json:"numberOfNodes,omitempty"`
 	// SkipReadinessProbe, when true, tells the operator NOT to inject its
-	// default /health readiness probe. Use for idle-pod / SSH-managed workers
-	// (e.g. the optimizer create-infera model) whose engine is (re)launched
-	// out-of-band after deploy: a /health probe would never pass at deploy time,
-	// leaving readyReplicas=0 and the InferaDeployment stuck in "pending". +optional
+	// readiness probe. Use for idle-pod / SSH-managed workers (e.g. the
+	// optimizer create-infera model) whose engine is (re)launched out-of-band
+	// after deploy: such a worker never registers, so it never opens its
+	// readiness port, leaving readyReplicas=0 and the InferaDeployment stuck
+	// in "pending". A worker that does serve must NOT set this — without a
+	// probe every pod counts as Ready the moment it is Running, and the
+	// surge rollout then retires the pod that is still serving. +optional
 	SkipReadinessProbe bool `json:"skipReadinessProbe,omitempty"`
 	// Image overrides spec.image for this service. +optional
 	Image string `json:"image,omitempty"`
@@ -120,6 +123,10 @@ type ServiceSpec struct {
 	// no metadata, so pod labels cannot ride along inside it; they are carried
 	// here instead. +optional
 	PodLabels map[string]string `json:"podLabels,omitempty"`
+	// PodAnnotations are extra annotations merged onto this service's pod
+	// template. Same seam as PodLabels for fields that must be annotations
+	// (for example primus-safe.user.account). +optional
+	PodAnnotations map[string]string `json:"podAnnotations,omitempty"`
 }
 
 // NATSSpec controls the operator-managed NATS (JetStream) for the KV-event

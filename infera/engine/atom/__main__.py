@@ -34,11 +34,16 @@ import logging
 import os
 import signal
 
-from infera.common.net import free_tcp_port
+from infera.common.net import free_tcp_port_block
 from infera.common.registration import RegistrationClient
 from infera.engine.atom.args import parse_atom_args
 from infera.engine.atom.worker import AtomEngine
 from infera.engine.base import EngineDeath, watch_engine_death
+from infera.engine.readiness import (
+    close_readiness,
+    engine_health_check,
+    serve_readiness_best_effort,
+)
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)  # silence etcd keepalive spam
@@ -64,11 +69,12 @@ def _kill_process_group_safely() -> None:
 async def main() -> None:
     args = parse_atom_args()
     logger.info(
-        "parsed args: model=%s host=%s server_port=%d tp=%d disagg=%s disagg_meta=%s",
+        "parsed args: model=%s host=%s server_port=%d tp=%d dp=%s disagg=%s disagg_meta=%s",
         args.model,
         args.host,
         args.server_port,
         args.tensor_parallel_size,
+        args.dp_size,
         args.disagg_mode,
         args.disagg_meta or "{}",
     )
@@ -86,7 +92,9 @@ async def main() -> None:
                 "--enable-kv-events with host=0.0.0.0 and no --advertise-host; "
                 "the KV events endpoint won't be reachable by a remote router"
             )
-        port = free_tcp_port()
+        # ATOM can load the model before its event publisher binds. Keep the
+        # selected port out of the ephemeral allocator during that delay.
+        port = free_tcp_port_block(1)
         kv_events_bind = f"tcp://*:{port}"
         kv_events_endpoint = f"tcp://{advertise_host}:{port}"
         kv_block_size = args.kv_block_size
@@ -124,6 +132,7 @@ async def main() -> None:
         kv_block_size=kv_block_size,
         disagg_mode=args.disagg_mode,
         disagg_meta=args.disagg_meta,
+        dp_size=args.dp_size,
     )
 
     try:
@@ -145,19 +154,31 @@ async def main() -> None:
         config.disagg_meta,
     )
 
-    logger.info("registering with etcd: %s prefix=%s", args.etcd_endpoint, args.etcd_prefix)
-    reg_client = RegistrationClient(endpoint=args.etcd_endpoint, prefix=args.etcd_prefix)
-    await reg_client.register(config)
-    hb_task = asyncio.create_task(reg_client.heartbeat_loop(), name="worker-heartbeat")
-
+    # Installed before registering, so a SIGTERM from here on runs the
+    # shutdown below instead of killing the process with its record published.
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
 
+    logger.info("registering with etcd: %s prefix=%s", args.etcd_endpoint, args.etcd_prefix)
+    reg_client = RegistrationClient(endpoint=args.etcd_endpoint, prefix=args.etcd_prefix)
+    await reg_client.register(config)
+    hb_task = asyncio.create_task(reg_client.heartbeat_loop(), name="worker-heartbeat")
+    # The operator probes readiness on this port for every single-node worker
+    # regardless of backend, so an ATOM worker that never opened it would sit
+    # NotReady forever.
+    ready_server = await serve_readiness_best_effort(
+        engine_alive=engine_health_check(args.host, config.port)
+    )
+
     death = EngineDeath()
     death_task = watch_engine_death(engine, stop, death)
     await stop.wait()
+
+    # Closed as shutdown begins, before deregistration: a surge rollout reads
+    # this, and the pod should stop claiming readiness now.
+    await close_readiness(ready_server)
 
     death_task.cancel()
     try:

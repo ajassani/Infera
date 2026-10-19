@@ -18,6 +18,10 @@ the **same** on the server and every worker. See
 | `--router-tokenizer-path` | (required) | tokenizer for prefix hashing; must match workers |
 | `--router-mode` | `auto` | `auto` (in-process policy) \| `direct` (trust a GAIE EPP's `x-worker-instance-id` pick) |
 | `--router-policy` | `kv-aware` | `kv-aware` \| `round-robin` (used when `--router-mode auto`) |
+| `--session-affinity` | `off` | `off` \| `prefill` \| `both`: pin `X-Session-ID` sessions on top of the policy |
+| `--session-affinity-ttl-seconds` | `3600` | idle seconds before a session binding is dropped, 1–86400 |
+| `--decode-input-demand` | (unset: `$INFERA_DECODE_INPUT_DEMAND`, else `off`) | `off` \| `shadow` \| `on`: pick Decode targets by in-flight input tokens (Rust backend, `kv-aware`) |
+| `--pd-prefill-guard-release` | (unset: `$INFERA_PD_PREFILL_GUARD_RELEASE`, else `decode`) | `decode` \| `completion`: release PD Prefill load when Decode ends or when Prefill completes (Rust backend) |
 | `--kv-overlap-weight` | `1.0` | KV-aware: cache locality vs load balance |
 | `--kv-prefill-overlap-weight` | (unset) | KV-aware PD: prefill-side weight (typical `20.0`); overrides the global |
 | `--kv-decode-overlap-weight` | (unset) | KV-aware PD: decode-side weight (typical `2.0`); overrides the global |
@@ -33,7 +37,10 @@ the **same** on the server and every worker. See
 | `--request-transport` | `nats` | `nats` \| `http` |
 | `--kv-event-transport` | `nats` | `nats` \| `zmq` |
 | `--nats-server` | `$NATS_SERVER` / `nats://127.0.0.1:4222` | broker URL |
-| `--nats-req-idle-timeout` | `900`s | per-chunk inactivity timeout (`0` = forever) |
+| `--nats-req-idle-timeout` | `900`s | per-chunk inactivity backstop that ends the request |
+| `--http-req-idle-timeout-s` | `0` (off) | same, for `--request-transport http` |
+| `--stream-admission-warn-s` | `240`s | log a stream still awaiting its first byte (reports only) |
+| `--stream-stall-warn-s` | `60`s | log a stream that went silent after producing bytes (reports only) |
 | `--nats-req-max-duration` | `0` (off) | hard wall-clock cap per request |
 | `--nats-req-max-pending` | `0` (off) | per-worker admission limit (→ 429) |
 | `--kvd-socket-path` | — | kvd UDS; enables `POST /v1/cache/prewarm` (L3 prefetch), else 503 |

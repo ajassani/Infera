@@ -6,7 +6,15 @@
 //! CLI / env configuration. Flag names mirror `infera.server.args` so the
 //! Python `--router-backend rust` shim can translate 1:1.
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+use crate::session_affinity::Mode as SessionAffinityMode;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PrefillGuardRelease {
+    Decode,
+    Completion,
+}
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "infera-router", about = "Infera router data plane (Rust)")]
@@ -43,6 +51,33 @@ pub struct Config {
     /// `round-robin` or `kv-aware` (DP-attention cache-locality routing).
     #[arg(long, default_value = "round-robin")]
     pub router_policy: String,
+
+    /// Release PD prefill load when its response completes, or retain it with decode.
+    #[arg(
+        long,
+        env = "INFERA_PD_PREFILL_GUARD_RELEASE",
+        value_enum,
+        default_value = "decode"
+    )]
+    pub pd_prefill_guard_release: PrefillGuardRelease,
+
+    /// Keep each `X-Session-ID` session on its last target: `prefill`
+    /// pins prefill picks only, `both` also decode and aggregated picks.
+    #[arg(long, value_enum, default_value = "off")]
+    pub session_affinity: SessionAffinityMode,
+
+    /// Idle seconds before a session binding is dropped.
+    #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u64).range(1..=86400))]
+    pub session_affinity_ttl_seconds: u64,
+
+    /// Decode input-token demand routing (kv-aware only); off, shadow or on.
+    #[arg(
+        long,
+        value_enum,
+        default_value = "off",
+        env = "INFERA_DECODE_INPUT_DEMAND"
+    )]
+    pub decode_input_demand: crate::decode_demand::Mode,
 
     /// `etcd` (external) or `kubernetes` (workers publish into their own Pod
     /// annotation and the API server is watched).
@@ -84,7 +119,15 @@ pub struct Config {
 
     /// Seconds to wait for the *next* reply chunk before giving up on a
     /// request. Reset on every chunk, so a long generation that keeps producing
-    /// tokens never trips it -- only a stall does. 0 disables it.
+    /// tokens never trips it -- only a stall does. Expiry is a 504, which
+    /// scores the worker. 0 disables it.
+    ///
+    /// Kept on, unlike the HTTP half below, because this transport has no
+    /// connection to lose: a worker that dies mid-stream simply stops
+    /// publishing, and the router would wait on a reply nobody will ever send.
+    /// An HTTP peer in the same state resets the socket, which surfaces as a
+    /// read error. The default is long enough to be a backstop rather than a
+    /// policy -- reporting a stall is `--stream-stall-warn-s`'s job.
     #[arg(long, default_value_t = 900.0, env = "INFERA_NATS_REQ_IDLE_TIMEOUT")]
     pub nats_req_idle_timeout_s: f64,
 
@@ -99,6 +142,44 @@ pub struct Config {
     /// default) keeps the transport pure core NATS.
     #[arg(long, default_value_t = 0, env = "INFERA_NATS_REQ_MAX_PENDING")]
     pub nats_req_max_pending: usize,
+
+    /// Seconds a stream may go without its *first* byte before the router
+    /// reports it, with the worker and request id. 0 disables the reporting.
+    ///
+    /// This window is admission -- queueing, prefill, and the KV transfer --
+    /// which a saturated decode queue has been measured holding for 200s at the
+    /// 99th percentile, so the default sits above that rather than reporting
+    /// every queued request as a fault.
+    #[arg(long, default_value_t = 240.0, env = "INFERA_STREAM_ADMISSION_WARN")]
+    pub stream_admission_warn_s: f64,
+
+    /// Seconds a stream that has already produced bytes may go silent before
+    /// the router reports it. 0 disables the reporting.
+    ///
+    /// Much shorter than the admission window above: a generation under way
+    /// emits tokens tens of milliseconds apart, so this silence is a fault
+    /// rather than a queue.
+    ///
+    /// Reporting only, on both windows: the stream keeps waiting, because
+    /// ending it early would fail requests that were still going to answer,
+    /// and a caller that does give up disconnects -- which already reclaims
+    /// the slot without the router deciding for it.
+    #[arg(long, default_value_t = 60.0, env = "INFERA_STREAM_STALL_WARN")]
+    pub stream_stall_warn_s: f64,
+
+    /// Seconds to wait for the *next* body chunk from a worker over HTTP before
+    /// failing the stream. Reset on every chunk. 0 (the default) disables it,
+    /// leaving `--stream-stall-warn-s` to report a stall without ending a
+    /// request the caller has not given up on. Set it only where a caller with
+    /// no timeout of its own would otherwise hold a stream open indefinitely.
+    #[arg(long, default_value_t = 0.0, env = "INFERA_HTTP_REQ_IDLE_TIMEOUT")]
+    pub http_req_idle_timeout_s: f64,
+
+    /// Seconds to wait for a detached PD prefill POST before aborting it.
+    /// Matches the Mooncake KVPoll window. 0 disables the wall-clock cap;
+    /// client-disconnect abort still runs.
+    #[arg(long, default_value_t = 300.0, env = "INFERA_PD_PREFILL_DRAIN_TIMEOUT")]
+    pub pd_prefill_drain_timeout_s: f64,
 
     /// kv-aware only: path to the model's HF fast tokenizer (`tokenizer.json` or
     /// its dir). Required for cache locality — without it kv-aware degrades to
@@ -172,6 +253,11 @@ impl Config {
                 Err(e) => anyhow::bail!("--kv-default-chat-template-kwargs is not JSON: {e}"),
             }
         }
+        if self.decode_input_demand != crate::decode_demand::Mode::Off
+            && self.router_policy != "kv-aware"
+        {
+            anyhow::bail!("--decode-input-demand requires --router-policy kv-aware");
+        }
         if self.router_policy == "kv-aware" && self.kv_tokenizer_path.is_none() {
             tracing::warn!(
                 "--router-policy kv-aware without --kv-tokenizer-path: block hashes \
@@ -237,12 +323,99 @@ mod tests {
     /// Values are from infera/server/args.py; changing one side means changing
     /// both.
     #[test]
+    fn prefill_guard_release_is_explicit_and_validated() {
+        let default = Config::try_parse_from(["infera-router"]).unwrap();
+        assert_eq!(
+            default.pd_prefill_guard_release,
+            PrefillGuardRelease::Decode
+        );
+        let enabled =
+            Config::try_parse_from(["infera-router", "--pd-prefill-guard-release", "completion"])
+                .unwrap();
+        assert_eq!(
+            enabled.pd_prefill_guard_release,
+            PrefillGuardRelease::Completion
+        );
+        assert!(
+            Config::try_parse_from(["infera-router", "--pd-prefill-guard-release", "typo"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn session_affinity_flags_are_validated() {
+        let default = Config::try_parse_from(["infera-router"]).unwrap();
+        assert_eq!(default.session_affinity, SessionAffinityMode::Off);
+        assert_eq!(default.session_affinity_ttl_seconds, 3600);
+        let both = Config::try_parse_from([
+            "infera-router",
+            "--session-affinity",
+            "both",
+            "--session-affinity-ttl-seconds",
+            "60",
+        ])
+        .unwrap();
+        assert_eq!(both.session_affinity, SessionAffinityMode::Both);
+        assert_eq!(both.session_affinity_ttl_seconds, 60);
+        for bad in [
+            ["--session-affinity", "Both"],
+            ["--session-affinity-ttl-seconds", "0"],
+            ["--session-affinity-ttl-seconds", "86401"],
+        ] {
+            assert!(Config::try_parse_from(["infera-router", bad[0], bad[1]]).is_err());
+        }
+    }
+
+    #[test]
     fn transport_defaults_match_the_python_backend() {
         let c = Config::try_parse_from(["infera-router"]).unwrap();
         assert_eq!(c.request_transport, "nats");
         assert_eq!(c.kv_event_transport, "nats");
         assert_eq!(c.discovery_backend, "etcd");
         assert_eq!(c.router_policy, "round-robin");
+    }
+
+    /// A stall has to be reported inside the window a caller waits, or the only
+    /// record of it is the caller's own timeout -- which is what made a stalled
+    /// stream diagnosable solely from the client side.
+    #[test]
+    fn a_stall_is_reported_before_a_caller_gives_up() {
+        const SDK_IDLE_TIMEOUT_S: f64 = 300.0;
+        let c = Config::try_parse_from(["infera-router"]).unwrap();
+        for (phase, warn) in [
+            ("admission", c.stream_admission_warn_s),
+            ("mid-stream", c.stream_stall_warn_s),
+        ] {
+            assert!(
+                warn > 0.0 && warn < SDK_IDLE_TIMEOUT_S,
+                "{phase} reporting is {warn}"
+            );
+        }
+    }
+
+    /// Admission covers a queue measured at 200s at the 99th percentile, so
+    /// reporting it on the mid-stream window would call every queued request a
+    /// fault. A generation under way emits tokens milliseconds apart.
+    #[test]
+    fn admission_is_given_a_longer_window_than_a_live_stream() {
+        let c = Config::try_parse_from(["infera-router"]).unwrap();
+        assert!(c.stream_admission_warn_s > 200.0);
+        assert!(c.stream_stall_warn_s < c.stream_admission_warn_s);
+    }
+
+    /// Ending a stalled stream is the caller's call: it disconnects, which
+    /// already reclaims the slot. Cutting first would fail requests still
+    /// waiting on admission, which outlasts a saturated decode queue.
+    ///
+    /// NATS keeps a backstop because it has no connection to lose: a worker
+    /// that dies mid-stream stops publishing and signals nothing, where an
+    /// HTTP peer resets the socket. The backstop has to stay well clear of the
+    /// windows a stall is reported on, or it becomes the policy again.
+    #[test]
+    fn only_the_transport_without_a_connection_ends_a_stalled_stream() {
+        let c = Config::try_parse_from(["infera-router"]).unwrap();
+        assert_eq!(c.http_req_idle_timeout_s, 0.0);
+        assert!(c.nats_req_idle_timeout_s > c.stream_admission_warn_s * 2.0);
     }
 
     #[test]
@@ -308,5 +481,25 @@ mod tests {
         let bad_disc =
             Config::try_parse_from(["infera-router", "--discovery-backend", "k8s"]).unwrap();
         assert!(bad_disc.validate().is_err());
+    }
+    #[test]
+    fn decode_demand_is_opt_in_and_requires_kv_aware() {
+        let off = Config::try_parse_from(["router", "--decode-input-demand", "off"]).unwrap();
+        assert!(off.validate().is_ok());
+        for mode in ["shadow", "on"] {
+            let invalid =
+                Config::try_parse_from(["router", "--decode-input-demand", mode]).unwrap();
+            assert!(invalid.validate().is_err());
+            let valid = Config::try_parse_from([
+                "router",
+                "--router-policy",
+                "kv-aware",
+                "--decode-input-demand",
+                mode,
+            ])
+            .unwrap();
+            assert!(valid.validate().is_ok());
+        }
+        assert!(Config::try_parse_from(["router", "--decode-input-demand", "enabled"]).is_err());
     }
 }

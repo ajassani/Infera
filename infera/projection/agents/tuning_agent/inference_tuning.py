@@ -332,6 +332,9 @@ def derive_inference_legality(
     # search that cannot say "fp4" cannot say anything about it: every trial is
     # rejected on memory before its performance is ever read.
     weight_dtype = ["bf16", "fp8", "fp4"]
+    validated = getattr(arch, "checkpoint_weight_dtypes", None)
+    if validated:
+        weight_dtype = [d for d in weight_dtype if d in validated] or list(validated)
     kv_cache_dtype = ["bf16", "fp8", "int8"]
     chunked_prefill_size = [0, 512, 1024, 2048]
     speculative_num_tokens = [0, 2, 4]
@@ -635,9 +638,7 @@ def validate_inference(
             if pool_dp < 1:
                 return False, f"{pool}_attention_dp={pool_dp} must be >= 1"
             if pool_dp > 1 and pool_tp % pool_dp:
-                return False, (
-                    f"{pool}_attention_dp={pool_dp} must divide {pool}_tp={pool_tp}"
-                )
+                return False, (f"{pool}_attention_dp={pool_dp} must divide {pool}_tp={pool_tp}")
         for pool, pool_tp, pool_ep in (
             ("prefill", p_tp, cfg.prefill_ep),
             ("decode", d_tp, cfg.decode_ep),
@@ -648,8 +649,7 @@ def validate_inference(
                 return False, f"{pool}_ep={pool_ep} not in legal EP set {legality.ep}"
             if pool_ep > 1 and (pool_tp * cfg.pp) % pool_ep:
                 return False, (
-                    f"{pool}_ep={pool_ep} must divide the {pool} pool's "
-                    f"{pool_tp * cfg.pp} ranks"
+                    f"{pool}_ep={pool_ep} must divide the {pool} pool's {pool_tp * cfg.pp} ranks"
                 )
         prefill_gpus = p_tp * cfg.pp * cfg.prefill_replicas
         decode_gpus = d_tp * cfg.pp * cfg.decode_replicas

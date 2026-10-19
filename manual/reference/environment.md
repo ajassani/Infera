@@ -59,7 +59,10 @@ checklist and the RDMA self-check.
 | Env | Default | What it does |
 |---|---|---|
 | `NATS_SERVER` / `NATS_URL` | *(injected by operator)* | NATS broker address when `--request-transport nats`. |
-| `INFERA_NATS_REQ_IDLE_TIMEOUT` | `900` (s) | Max wait for the next reply chunk; expiry → 504 + cancel. `0` = forever. |
+| `INFERA_NATS_REQ_IDLE_TIMEOUT` | `900` (s) | Max wait for the next reply chunk; expiry → 504 + cancel. A backstop; a stall is reported by the two warnings below. |
+| `INFERA_HTTP_REQ_IDLE_TIMEOUT` | `0` (off) | Same, for `--request-transport http`; expiry fails the stream. |
+| `INFERA_STREAM_ADMISSION_WARN` | `240` (s) | Log a stream still awaiting its first byte, with worker + request id. Reports only. |
+| `INFERA_STREAM_STALL_WARN` | `60` (s) | Log a stream that went silent after producing bytes. Reports only. |
 | `INFERA_NATS_REQ_MAX_DURATION` | `0` (off) | Hard wall-clock cap on a whole request. |
 | `INFERA_NATS_REQ_MAX_PENDING` | `0` (off) | Per-worker admission limit; backlog at the cap → 429. |
 | `INFERA_REQUEST_MAX_RETRIES` | `1` | Retry on an alternate worker before the first token (never mid-stream). `0` = fail fast. |
@@ -74,6 +77,7 @@ and the [CLI reference](cli.md).
 | Env | Default | What it does |
 |---|---|---|
 | `INFERA_NODEPORT_RANGE` | `30000-32767` | Port window every auto-allocated port must avoid (kv-event publishers, single or a per-DP-rank block, and the ATOM rendezvous port) — Kubernetes' NodePort range, where a Service claim makes the port unreachable from the node IP we advertise. Set `lo-hi` for a cluster that moved the range, `none` to drop the guard. Only `none`/`off` drop it — an empty or malformed value keeps the default. |
+| `INFERA_ENGINE_READY_TIMEOUT` | `1800` (s) | Maximum time the SGLang/vLLM wrapper waits for the child engine `/health` endpoint during startup. Increase for slow model storage or long JIT compilation; non-numeric, non-finite or non-positive values fall back to 1800. This is separate from disaggregation bootstrap and runtime watchdog timeouts. |
 
 ## Engine correctness
 

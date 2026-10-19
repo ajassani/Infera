@@ -91,19 +91,7 @@ func (r *InferaDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Req
 				"deployments outside Kubernetes",
 			idep.Spec.DiscoveryBackend,
 		)
-		lg.Error(err, "refusing to reconcile")
-		idep.Status.ObservedGeneration = idep.Generation
-		idep.Status.State = inferav1alpha1.StateFailed
-		if uerr := r.Status().Update(ctx, idep); uerr != nil {
-			lg.Error(uerr, "status update failed")
-		}
-		// Wrapped as terminal so it is recorded once and dropped. A plain error
-		// is re-queued with exponential backoff and retried forever, and no
-		// amount of retrying edits a spec field -- it would only produce two
-		// error logs and a status write per attempt, with
-		// reconcile_errors_total climbing until someone changes the CR. Editing
-		// the CR re-triggers reconciliation on its own.
-		return ctrl.Result{}, reconcile.TerminalError(err)
+		return ctrl.Result{}, r.refuse(ctx, idep, err)
 	}
 
 	// 0. Kubernetes-native discovery RBAC: a namespaced ServiceAccount + Role so
@@ -190,6 +178,26 @@ func (r *InferaDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 }
 
+// refuse records a spec the operator will not render and stops reconciling it.
+//
+// Wrapped as terminal so it is recorded once and dropped. A plain error is
+// re-queued with exponential backoff and retried forever, and no amount of
+// retrying edits a spec field -- it would only produce two error logs and a
+// status write per attempt, with reconcile_errors_total climbing until someone
+// changes the CR. Editing the CR re-triggers reconciliation on its own.
+func (r *InferaDeploymentReconciler) refuse(
+	ctx context.Context, idep *inferav1alpha1.InferaDeployment, err error,
+) error {
+	lg := log.FromContext(ctx)
+	lg.Error(err, "refusing to reconcile")
+	idep.Status.ObservedGeneration = idep.Generation
+	idep.Status.State = inferav1alpha1.StateFailed
+	if uerr := r.Status().Update(ctx, idep); uerr != nil {
+		lg.Error(uerr, "status update failed")
+	}
+	return reconcile.TerminalError(err)
+}
+
 // applyObject create-or-updates a typed object, setting the owner reference.
 func (r *InferaDeploymentReconciler) applyObject(ctx context.Context, idep *inferav1alpha1.InferaDeployment, desired client.Object) error {
 	// Build a fresh empty object of the same kind keyed by name/namespace.
@@ -215,6 +223,15 @@ func (r *InferaDeploymentReconciler) applyUnstructured(ctx context.Context, idep
 			current = map[string]any{}
 		}
 		merged := mergeSpec(current, spec, ownedSpecFields(desired.GetKind()))
+		// The worker pod template's labels and annotations are entirely the
+		// operator's. mergeSpec keeps keys that disappeared from a nested map,
+		// so a removed podLabels or podAnnotations entry would stay on a
+		// multi-node LeaderWorkerSet. Deployments replace .spec outright and
+		// do not have this gap.
+		if desired.GetKind() == lwsKind {
+			replaceOwnedMap(merged, spec, "leaderWorkerTemplate", "workerTemplate", "metadata", "labels")
+			replaceOwnedMap(merged, spec, "leaderWorkerTemplate", "workerTemplate", "metadata", "annotations")
+		}
 		_ = unstructured.SetNestedMap(existing.Object, merged, "spec")
 		existing.SetLabels(desired.GetLabels())
 		return controllerutil.SetControllerReference(idep, existing, r.Scheme)
@@ -242,6 +259,22 @@ func ownedSpecFields(kind string) map[string]bool {
 		return map[string]bool{"replicas": true, "leaderWorkerTemplate": true}
 	}
 	return nil
+}
+
+// replaceOwnedMap sets dst's nested map to a copy of src's, or removes it
+// when src does not have that map. Used for fields the operator owns
+// completely inside an otherwise deep-merged spec.
+func replaceOwnedMap(dst, src map[string]any, fields ...string) {
+	val, found, err := unstructured.NestedMap(src, fields...)
+	if err != nil || !found {
+		unstructured.RemoveNestedField(dst, fields...)
+		return
+	}
+	copied := make(map[string]any, len(val))
+	for k, v := range val {
+		copied[k] = v
+	}
+	_ = unstructured.SetNestedMap(dst, copied, fields...)
 }
 
 // mergeSpec overlays the fields the operator sets onto what is already there,

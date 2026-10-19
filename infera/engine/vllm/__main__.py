@@ -20,12 +20,17 @@ from infera.common.disagg_preflight import (
     validate_advertise_host,
     validate_vllm_transport,
 )
-from infera.common.net import free_tcp_port
+from infera.common.net import free_tcp_port_block
 from infera.common.registration import RegistrationClient
 from infera.common.worker_pool import DisaggMode, KvRegistrationMetadata
 from infera.engine.base import EngineDeath, watch_engine_death
 from infera.engine.drain import drain_engine_inflight
 from infera.engine.flush import anchor_kv_chain
+from infera.engine.readiness import (
+    close_readiness,
+    engine_health_check,
+    serve_readiness_best_effort,
+)
 from infera.engine.vllm.args import VllmWorkerArgs, parse_vllm_args
 from infera.engine.vllm.worker import VllmEngine
 
@@ -51,7 +56,9 @@ def _inject_kv_events_config(args: VllmWorkerArgs) -> str | None:
     # vLLM to emit 8-byte ints rather than 32-byte sha256 digests.
     os.environ["VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES"] = "1"
 
-    port = free_tcp_port()
+    # vLLM creates its KV-event publisher after model startup. Keep the chosen
+    # port below the ephemeral range so it is not recycled before that bind.
+    port = free_tcp_port_block(1)
     # vLLM's ZmqEventPublisher decides bind-vs-connect by a string heuristic:
     # `*` or `::` means bind, anything else means connect (see
     # vllm/distributed/kv_events.py _socket_setup). `tcp://*:<port>` is the
@@ -361,17 +368,29 @@ async def main() -> None:
             observed=kv_relay.cleared_observed,
         )
 
-    await reg_client.register(config)
-    hb_task = asyncio.create_task(reg_client.heartbeat_loop(), name="worker-heartbeat")
-
+    # Installed before registering, so a SIGTERM from here on runs the
+    # shutdown below instead of killing the process with its record published.
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
 
+    await reg_client.register(config)
+    hb_task = asyncio.create_task(reg_client.heartbeat_loop(), name="worker-heartbeat")
+    # The operator probes readiness on this port for every worker regardless of
+    # backend, so a vLLM worker that never opened it would sit NotReady forever.
+    ready_server = await serve_readiness_best_effort(
+        engine_alive=engine_health_check(args.host, config.port)
+    )
+
     death = EngineDeath()
     death_task = watch_engine_death(engine, stop, death)
     await stop.wait()
+
+    # Closed as shutdown begins, before deregistration: this is the signal a
+    # surge rollout reads, and it should stop claiming readiness now rather
+    # than once in-flight work has finished.
+    await close_readiness(ready_server)
 
     death_task.cancel()
     try:

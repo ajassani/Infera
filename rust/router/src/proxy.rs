@@ -8,42 +8,274 @@
 //! `Body::from_stream`, so per-token work runs on Tokio's threads, not ours.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use tokio::sync::oneshot;
+
 use axum::body::{Body, Bytes};
 use axum::http::{header, StatusCode};
 use axum::response::Response;
 use futures::Stream;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::breaker::is_worker_fault;
 use crate::dp;
 use crate::handlers::AppState;
-use crate::policy::{ActiveGuard, Role};
+use crate::policy::{ActiveGuard, RequestTokens, Role};
 use crate::pool::{DisaggMode, RouteTarget, Snapshot};
 use crate::util::{json_error, truncate_chars};
 
-type AttemptResult = Result<Response, Box<Response>>;
+/// Pre-first-byte failure. The tracker is handed back so the caller can record
+/// the whole request, including retries, instead of starting a new one.
+struct AttemptFail {
+    response: Response,
+    tracker: Option<crate::metrics::RequestTracker>,
+}
+
+type AttemptResult = Result<Response, Box<AttemptFail>>;
+
+fn fail(tracker: Option<crate::metrics::RequestTracker>, response: Response) -> AttemptResult {
+    Err(Box::new(AttemptFail { response, tracker }))
+}
+
+const SSE_DONE_MARKER: &[u8] = b"data: [DONE]";
+const RESPONSES_DONE_MARKER: &[u8] = b"event: response.completed";
+
+/// Rolling match for an SSE success marker, which may straddle two chunks.
+struct DoneMarker {
+    marker: &'static [u8],
+    matched: usize,
+    seen: bool,
+}
+
+impl DoneMarker {
+    fn for_path(path: &str) -> Self {
+        DoneMarker {
+            marker: if path == "/v1/responses" {
+                RESPONSES_DONE_MARKER
+            } else {
+                SSE_DONE_MARKER
+            },
+            matched: 0,
+            seen: false,
+        }
+    }
+
+    fn feed(&mut self, chunk: &[u8]) {
+        if self.seen {
+            return;
+        }
+        for &byte in chunk {
+            // The marker has no proper border, so a mismatch can only restart
+            // the match at the byte that failed it.
+            self.matched = if byte == self.marker[self.matched] {
+                self.matched + 1
+            } else {
+                usize::from(byte == self.marker[0])
+            };
+            if self.matched == self.marker.len() {
+                self.seen = true;
+                return;
+            }
+        }
+    }
+}
+
+/// Builder for an SSE response: the content type, plus the header that tells an
+/// nginx hop to stream it rather than buffer it.
+///
+/// `X-Accel-Buffering: no` is per-response and overrides a location's
+/// `proxy_buffering on`, which otherwise accumulates events and hands the
+/// client silence while the worker is streaming normally. Every SSE reply goes
+/// through here so a new endpoint cannot be added without it.
+pub(crate) fn sse_response() -> axum::http::response::Builder {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header("x-accel-buffering", "no")
+}
+
+/// What a guarded stream is relaying. `path` picks the SSE terminator; the ids
+/// are what a mid-body failure is reported against, since that failure lands
+/// inside `poll_next` long after the call site has returned -- without them the
+/// only trace of a stalled worker is the caller's own timeout.
+#[derive(Clone, Default)]
+pub(crate) struct StreamSource {
+    pub(crate) path: String,
+    pub(crate) worker_id: String,
+    /// Empty on the mixed paths, where no protocol forges a request id.
+    pub(crate) request_id: String,
+    /// Windows after which a silent stream is reported. Zero reports nothing.
+    pub(crate) stall_warn: StallWarn,
+}
+
+impl StreamSource {
+    fn log_failure(&self, error: impl std::fmt::Display) {
+        tracing::warn!(
+            worker = %self.worker_id,
+            request_id = %self.request_id,
+            path = %self.path,
+            %error,
+            "worker stream failed mid-body"
+        );
+    }
+
+    fn log_stall(&self, silent_for: Duration, mid_stream: bool) {
+        tracing::warn!(
+            worker = %self.worker_id,
+            request_id = %self.request_id,
+            path = %self.path,
+            silent_for_s = silent_for.as_secs(),
+            phase = if mid_stream { "mid-stream" } else { "awaiting first byte" },
+            "worker stream is silent; still waiting"
+        );
+    }
+}
+
+/// How long a stream may stay silent before the router reports it.
+///
+/// Split because the two silences differ by orders of magnitude and only one
+/// of them is a fault. The wait before the first byte is admission, which a
+/// saturated decode queue has been measured holding for 200s at the 99th
+/// percentile; a generation already under way emits tokens tens of
+/// milliseconds apart, so the same window there would report a stall long
+/// after it mattered. Either may be zero to report nothing for that phase.
+#[derive(Clone, Copy, Default)]
+pub struct StallWarn {
+    pub before_first_byte: Duration,
+    pub mid_stream: Duration,
+}
+
+/// Reports a stream that has gone quiet, without ending it.
+///
+/// Polled on the pending path, so its timer is what wakes the task when no
+/// bytes arrive -- nothing else runs during a stall, which is why a stall was
+/// previously only observable once it ended. Each elapsed period is reported
+/// and the timer re-armed, so a long one leaves a trail of its cumulative
+/// silence rather than a single line.
+struct StallWatch {
+    warn: StallWarn,
+    seen_bytes: bool,
+    timer: Pin<Box<tokio::time::Sleep>>,
+    silent_for: Duration,
+}
+
+impl StallWatch {
+    fn new(warn: StallWarn) -> Option<Self> {
+        if warn.before_first_byte.is_zero() && warn.mid_stream.is_zero() {
+            return None;
+        }
+        let mut watch = StallWatch {
+            warn,
+            seen_bytes: false,
+            timer: Box::pin(tokio::time::sleep(Duration::ZERO)),
+            silent_for: Duration::ZERO,
+        };
+        watch.rearm();
+        Some(watch)
+    }
+
+    /// The window for the phase this stream is in.
+    fn period(&self) -> Duration {
+        if self.seen_bytes {
+            self.warn.mid_stream
+        } else {
+            self.warn.before_first_byte
+        }
+    }
+
+    /// The stream is alive, and past admission: the shorter window applies now.
+    fn saw_bytes(&mut self) {
+        self.seen_bytes = true;
+        self.silent_for = Duration::ZERO;
+        self.rearm();
+    }
+
+    /// Cumulative silence and whether it is mid-stream, once another period has
+    /// passed with no bytes.
+    fn poll_stalled(&mut self, cx: &mut Context<'_>) -> Option<(Duration, bool)> {
+        let period = self.period();
+        if period.is_zero() || self.timer.as_mut().poll(cx).is_pending() {
+            return None;
+        }
+        self.silent_for += period;
+        // `reset` re-registers the entry and keeps its waker, so the next
+        // deadline wakes the task on its own -- the stall test drives nothing
+        // by hand and still sees the whole cumulative trail.
+        self.rearm();
+        Some((self.silent_for, self.seen_bytes))
+    }
+
+    fn rearm(&mut self) {
+        let period = self.period();
+        if period.is_zero() {
+            return;
+        }
+        let deadline = tokio::time::Instant::now() + period;
+        self.timer.as_mut().reset(deadline);
+    }
+}
 
 /// A byte stream that owns an `ActiveGuard`: when the streamed body ends (client
 /// done, disconnect, or drop), the guard drops and fires `on_request_finished`,
 /// so a cost-aware policy's in-flight load stays balanced for streamed requests.
+///
+/// With an `on_end` channel the stream also reports how it ended. Completion is
+/// then the SSE terminator, not EOF: an upstream that closes mid-generation
+/// ends the body without error, and reading that as success would leave the
+/// other PD leg holding the bootstrap room with nobody aborting it.
 pub(crate) struct GuardedStream {
     inner: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
     _guard: ActiveGuard,
+    completed: bool,
+    failed: bool,
+    // Only tracked for an `on_end` stream; `None` keeps EOF meaning completion.
+    done: Option<DoneMarker>,
+    stall: Option<StallWatch>,
+    source: StreamSource,
+    on_end: Option<oneshot::Sender<StreamEnd>>,
+    /// Serving metrics; closed on Drop once the stream ends.
+    tracker: Option<crate::metrics::RequestTracker>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StreamEnd {
+    Complete,
+    Incomplete,
 }
 
 impl GuardedStream {
+    /// Test helper: production paths always pass an abort channel and/or tracker.
+    #[cfg(test)]
     pub(crate) fn new(
         inner: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
         guard: ActiveGuard,
+        source: StreamSource,
+    ) -> Self {
+        Self::new_with_incomplete_abort(inner, guard, source, None, None)
+    }
+
+    pub(crate) fn new_with_incomplete_abort(
+        inner: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+        guard: ActiveGuard,
+        source: StreamSource,
+        on_end: Option<oneshot::Sender<StreamEnd>>,
+        tracker: Option<crate::metrics::RequestTracker>,
     ) -> Self {
         GuardedStream {
             inner: Box::pin(inner),
             _guard: guard,
+            completed: false,
+            failed: false,
+            done: on_end.as_ref().map(|_| DoneMarker::for_path(&source.path)),
+            stall: StallWatch::new(source.stall_warn),
+            source,
+            on_end,
+            tracker,
         }
     }
 }
@@ -52,7 +284,71 @@ impl Stream for GuardedStream {
     type Item = reqwest::Result<Bytes>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // GuardedStream is Unpin (Pin<Box<..>> + ActiveGuard are both Unpin).
-        self.get_mut().inner.as_mut().poll_next(cx)
+        let this = self.get_mut();
+        let out = this.inner.as_mut().poll_next(cx);
+        match &out {
+            Poll::Ready(Some(Ok(chunk))) => {
+                if let Some(stall) = this.stall.as_mut() {
+                    stall.saw_bytes();
+                }
+                if let Some(tracker) = this.tracker.as_mut() {
+                    tracker.observe_stream_chunk(chunk);
+                }
+                if let Some(done) = this.done.as_mut() {
+                    done.feed(chunk);
+                    // The client holds the whole answer as soon as the
+                    // terminator reaches it, and may drop the body without
+                    // ever polling for EOF.
+                    this.completed = done.seen;
+                }
+            }
+            // A break after the terminator still leaves the client short of
+            // the bytes it was about to read.
+            Poll::Ready(Some(Err(error))) => {
+                this._guard.invalidate_sessions();
+                this.failed = true;
+                this.completed = false;
+                this.source.log_failure(error);
+            }
+            Poll::Ready(None) => {
+                let terminated = this.done.as_ref().is_none_or(|d| d.seen);
+                this.completed = !this.failed && terminated;
+                if !this.completed {
+                    this._guard.invalidate_sessions();
+                }
+            }
+            Poll::Pending => {
+                if let Some((silent_for, mid)) =
+                    this.stall.as_mut().and_then(|s| s.poll_stalled(cx))
+                {
+                    this.source.log_stall(silent_for, mid);
+                }
+            }
+        }
+        out
+    }
+}
+
+impl Drop for GuardedStream {
+    fn drop(&mut self) {
+        if let Some(tx) = self.on_end.take() {
+            let end = if self.completed {
+                StreamEnd::Complete
+            } else {
+                StreamEnd::Incomplete
+            };
+            let _ = tx.send(end);
+        }
+        if let Some(mut tracker) = self.tracker.take() {
+            tracker.set_outcome(if self.completed && !self.failed {
+                "ok"
+            } else if self.failed {
+                "error"
+            } else {
+                "stream_failed"
+            });
+            tracker.finish();
+        }
     }
 }
 
@@ -72,13 +368,16 @@ impl Stream for GuardedStream {
 // a `?` chain: neither of these is propagated with `?`, both are matched one
 // frame up.
 #[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)] // tracker rides alongside the existing attempt inputs
 async fn attempt_nats(
     nats: &Arc<crate::nats_request::NatsRequestClient>,
     target: &RouteTarget,
     raw: &Bytes,
     stream: bool,
     path: &str,
+    stall_warn: StallWarn,
     guard: ActiveGuard,
+    mut tracker: Option<crate::metrics::RequestTracker>,
 ) -> AttemptResult {
     use crate::nats_request::Frame;
 
@@ -96,28 +395,35 @@ async fn attempt_nats(
         let body =
             serde_json::json!({ "error": format!("worker {wid} request backlog over limit") })
                 .to_string();
-        return Err(Box::new(
+        return fail(
+            tracker,
             Response::builder()
                 .status(StatusCode::TOO_MANY_REQUESTS)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("Retry-After", "1")
                 .body(Body::from(body))
                 .expect("429 response is valid"),
-        ));
+        );
     }
 
-    let body: serde_json::Value = match serde_json::from_slice(raw) {
+    let mut body: serde_json::Value = match serde_json::from_slice(raw) {
         Ok(v) => v,
         Err(e) => {
-            return Err(Box::new(json_error(
-                StatusCode::BAD_REQUEST,
-                &format!("request body is not JSON: {e}"),
-            )))
+            return fail(
+                tracker,
+                json_error(
+                    StatusCode::BAD_REQUEST,
+                    &format!("request body is not JSON: {e}"),
+                ),
+            )
         }
     };
+    if let serde_json::Value::Object(m) = &mut body {
+        dp::insert_body_rank(m, target);
+    }
     // Same envelope the Python router publishes; the worker side is shared.
     let mut headers = serde_json::Map::new();
-    if let Some(r) = target.dp_rank {
+    if let Some(r) = dp::header_rank(target) {
         headers.insert(
             dp::DP_RANK_HEADER.to_string(),
             serde_json::Value::String(r.to_string()),
@@ -132,20 +438,26 @@ async fn attempt_nats(
     let encoded = match serde_json::to_vec(&payload) {
         Ok(v) => v,
         Err(e) => {
-            return Err(Box::new(json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("encoding the nats request: {e}"),
-            )))
+            return fail(
+                tracker,
+                json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("encoding the nats request: {e}"),
+                ),
+            )
         }
     };
 
     let mut reply = match nats.dispatch(&wid, &encoded).await {
         Ok(r) => r,
         Err(e) => {
-            return Err(Box::new(json_error(
-                StatusCode::BAD_GATEWAY,
-                &format!("worker {wid} unreachable over nats: {e}"),
-            )))
+            return fail(
+                tracker,
+                json_error(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("worker {wid} unreachable over nats: {e}"),
+                ),
+            )
         }
     };
 
@@ -162,11 +474,14 @@ async fn attempt_nats(
                     break;
                 }
                 Some(Frame::Error { status: s, message }) => {
-                    return Err(Box::new(json_error(
-                        s.and_then(|c| StatusCode::from_u16(c).ok())
-                            .unwrap_or(StatusCode::BAD_GATEWAY),
-                        &format!("worker {wid} nats failed: {}", trim(&message)),
-                    )))
+                    return fail(
+                        tracker,
+                        json_error(
+                            s.and_then(|c| StatusCode::from_u16(c).ok())
+                                .unwrap_or(StatusCode::BAD_GATEWAY),
+                            &format!("worker {wid} nats failed: {}", trim(&message)),
+                        ),
+                    )
                 }
                 None => break,
             }
@@ -176,10 +491,13 @@ async fn attempt_nats(
         // mid-request, and reporting it as success would also record it as
         // healthy against the breaker.
         if !done_seen {
-            return Err(Box::new(json_error(
-                StatusCode::BAD_GATEWAY,
-                &format!("worker {wid} closed the nats reply without finishing"),
-            )));
+            return fail(
+                tracker,
+                json_error(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("worker {wid} closed the nats reply without finishing"),
+                ),
+            );
         }
         let total: usize = chunks.iter().map(|c| c.len()).sum();
         let mut buf = Vec::with_capacity(total);
@@ -190,15 +508,30 @@ async fn attempt_nats(
         // to the request and every worker would answer the same, so it is
         // returned rather than retried. Same rule as the HTTP path.
         if is_worker_fault(status.as_u16()) {
-            return Err(Box::new(
+            return fail(
+                tracker,
                 Response::builder()
                     .status(status)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(buf))
                     .expect("unary response is valid"),
-            ));
+            );
         }
         let _guard = guard;
+        if let Some(mut t) = tracker.take() {
+            if let Ok(v) = serde_json::from_slice::<Value>(&buf) {
+                if let Some(usage) = v.get("usage") {
+                    if let Some(p) = usage.get("prompt_tokens").and_then(|x| x.as_u64()) {
+                        t.set_input_tokens(p);
+                    }
+                    if let Some(c) = usage.get("completion_tokens").and_then(|x| x.as_u64()) {
+                        t.set_output_tokens(c);
+                    }
+                }
+            }
+            t.set_outcome("ok");
+            t.finish();
+        }
         return Ok(Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "application/json")
@@ -211,34 +544,43 @@ async fn attempt_nats(
     let first = match reply.next().await {
         Some(Frame::Data(b)) => b,
         Some(Frame::Error { status: s, message }) => {
-            return Err(Box::new(json_error(
-                s.and_then(|c| StatusCode::from_u16(c).ok())
-                    .unwrap_or(StatusCode::BAD_GATEWAY),
-                &format!("worker {wid} nats stream failed: {}", trim(&message)),
-            )))
+            return fail(
+                tracker,
+                json_error(
+                    s.and_then(|c| StatusCode::from_u16(c).ok())
+                        .unwrap_or(StatusCode::BAD_GATEWAY),
+                    &format!("worker {wid} nats stream failed: {}", trim(&message)),
+                ),
+            )
         }
         Some(Frame::Done { status }) => {
             let code = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
             if is_worker_fault(code.as_u16()) {
-                return Err(Box::new(json_error(
-                    code,
-                    &format!("worker {wid} ended the stream with {code}"),
-                )));
+                return fail(
+                    tracker,
+                    json_error(code, &format!("worker {wid} ended the stream with {code}")),
+                );
             }
             // Nothing to stream, but not a fault: answer with an empty body
             // rather than failing over a request the worker considers done.
             let _guard = guard;
-            return Ok(Response::builder()
+            if let Some(mut t) = tracker.take() {
+                t.set_outcome("ok");
+                t.finish();
+            }
+            return Ok(sse_response()
                 .status(code)
-                .header(header::CONTENT_TYPE, "text/event-stream")
                 .body(Body::empty())
                 .expect("stream response is valid"));
         }
         None => {
-            return Err(Box::new(json_error(
-                StatusCode::BAD_GATEWAY,
-                &format!("worker {wid} closed the nats reply with no frames"),
-            )))
+            return fail(
+                tracker,
+                json_error(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("worker {wid} closed the nats reply with no frames"),
+                ),
+            )
         }
     };
 
@@ -246,15 +588,18 @@ async fn attempt_nats(
     // is released when the client finishes, disconnects, or drops -- and the
     // ReplyStream moves in with it, so dropping the body cancels the worker.
     // `None` for the reply state ends the stream.
+    let bindings = guard.session_bindings();
     let body = futures::stream::unfold(
-        (Some(reply), Some(first), wid.clone()),
-        |(reply, pending, wid)| async move {
+        (Some(reply), Some(first), wid.clone(), bindings),
+        |(reply, pending, wid, bindings)| async move {
             if let Some(b) = pending {
-                return Some((Ok::<Bytes, std::io::Error>(b), (reply, None, wid)));
+                return Some((Ok::<Bytes, std::io::Error>(b), (reply, None, wid, bindings)));
             }
             let mut r = reply?;
-            match r.next().await {
-                Some(Frame::Data(b)) => Some((Ok(b), (Some(r), None, wid))),
+            let frame = r.next().await;
+            crate::session_affinity::observe_reply(frame.as_ref(), &bindings);
+            match frame {
+                Some(Frame::Data(b)) => Some((Ok(b), (Some(r), None, wid, bindings))),
                 Some(Frame::Error { message, .. }) => {
                     tracing::warn!(
                         "stream from worker {wid} failed mid-stream: {}",
@@ -265,16 +610,24 @@ async fn attempt_nats(
                     let chunk = Bytes::from(format!(
                         "data: {{\"error\":\"worker {wid} stream failed mid-stream\"}}\n\n"
                     ));
-                    Some((Ok(chunk), (None, None, wid)))
+                    Some((Ok(chunk), (None, None, wid, bindings)))
                 }
                 Some(Frame::Done { .. }) | None => None,
             }
         },
     );
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .body(Body::from_stream(guarded(body, guard)))
+    Ok(sse_response()
+        .body(Body::from_stream(guarded_with_tracker(
+            body,
+            guard,
+            StreamSource {
+                path: path.to_string(),
+                worker_id: wid,
+                request_id: String::new(),
+                stall_warn,
+            },
+            tracker,
+        )))
         .expect("stream response is valid"))
 }
 
@@ -286,37 +639,149 @@ fn trim(s: &str) -> &str {
 pub(crate) struct GuardedBody {
     inner: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
     _guard: ActiveGuard,
+    completed: bool,
+    failed: bool,
+    // Only tracked for an `on_end` body; the frame protocol carries its own
+    // terminator, so the marker only makes completion observable earlier.
+    done: Option<DoneMarker>,
+    stall: Option<StallWatch>,
+    source: StreamSource,
+    on_end: Option<oneshot::Sender<StreamEnd>>,
+    tracker: Option<crate::metrics::RequestTracker>,
 }
 
 /// Tie a byte stream to an `ActiveGuard`, so the policy's in-flight count is
 /// released when the client finishes, disconnects, or drops.
-pub(crate) fn guarded(
+pub(crate) fn guarded_with_tracker(
     inner: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
     guard: ActiveGuard,
+    source: StreamSource,
+    tracker: Option<crate::metrics::RequestTracker>,
+) -> GuardedBody {
+    guarded_with_incomplete_abort(inner, guard, source, None, tracker)
+}
+
+pub(crate) fn guarded_with_incomplete_abort(
+    inner: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+    guard: ActiveGuard,
+    source: StreamSource,
+    on_end: Option<oneshot::Sender<StreamEnd>>,
+    tracker: Option<crate::metrics::RequestTracker>,
 ) -> GuardedBody {
     GuardedBody {
         inner: Box::pin(inner),
         _guard: guard,
+        completed: false,
+        failed: false,
+        done: on_end.as_ref().map(|_| DoneMarker::for_path(&source.path)),
+        stall: StallWatch::new(source.stall_warn),
+        source,
+        on_end,
+        tracker,
     }
 }
 
 impl Stream for GuardedBody {
     type Item = Result<Bytes, std::io::Error>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.get_mut().inner.as_mut().poll_next(cx)
+        let this = self.get_mut();
+        let out = this.inner.as_mut().poll_next(cx);
+        match &out {
+            Poll::Ready(Some(Ok(chunk))) => {
+                if let Some(stall) = this.stall.as_mut() {
+                    stall.saw_bytes();
+                }
+                if let Some(tracker) = this.tracker.as_mut() {
+                    tracker.observe_stream_chunk(chunk);
+                }
+                if let Some(done) = this.done.as_mut() {
+                    done.feed(chunk);
+                    // Same race as the HTTP leg: the client can drop the body
+                    // between the terminal bytes and the done frame.
+                    this.completed = done.seen;
+                }
+            }
+            Poll::Ready(Some(Err(error))) => {
+                this._guard.invalidate_sessions();
+                this.failed = true;
+                this.completed = false;
+                this.source.log_failure(error);
+            }
+            Poll::Ready(None) => this.completed = !this.failed,
+            Poll::Pending => {
+                if let Some((silent_for, mid)) =
+                    this.stall.as_mut().and_then(|s| s.poll_stalled(cx))
+                {
+                    this.source.log_stall(silent_for, mid);
+                }
+            }
+        }
+        out
     }
 }
 
-/// Upstream client: unbounded connection pool, no read timeout (generations run
-/// arbitrarily long), bounded connect so unreachable workers fail fast.
-pub fn build_upstream_client() -> anyhow::Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
+impl Drop for GuardedBody {
+    fn drop(&mut self) {
+        if let Some(tx) = self.on_end.take() {
+            let end = if self.completed {
+                StreamEnd::Complete
+            } else {
+                StreamEnd::Incomplete
+            };
+            let _ = tx.send(end);
+        }
+        if let Some(mut tracker) = self.tracker.take() {
+            tracker.set_outcome(if self.completed && !self.failed {
+                "ok"
+            } else if self.failed {
+                "error"
+            } else {
+                "stream_failed"
+            });
+            tracker.finish();
+        }
+    }
+}
+
+/// Upstream client: unbounded connection pool, bounded connect so unreachable
+/// workers fail fast, and a read timeout that only a stall can trip.
+///
+/// Deliberately not a total timeout: reqwest resets the read timeout on every
+/// chunk, so a generation that keeps producing tokens runs as long as it needs
+/// while an engine that goes quiet fails the stream instead of holding the
+/// client open. The NATS transport has always had this; this is the HTTP half.
+pub fn build_upstream_client(idle_timeout_s: f64) -> anyhow::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(60))
-        .pool_max_idle_per_host(1024)
-        .build()?)
+        .pool_max_idle_per_host(1024);
+    if idle_timeout_s > 0.0 {
+        builder = builder.read_timeout(Duration::from_secs_f64(idle_timeout_s));
+    }
+    Ok(builder.build()?)
 }
 
 pub async fn dispatch(state: &AppState, raw: Bytes, path: &'static str) -> Response {
+    dispatch_session(state, raw, path, None).await
+}
+
+pub async fn dispatch_headers(
+    state: &AppState,
+    raw: Bytes,
+    path: &'static str,
+    headers: &axum::http::HeaderMap,
+) -> Response {
+    match state.sessions.header(headers) {
+        Ok(session) => dispatch_session(state, raw, path, session).await,
+        Err(error) => json_error(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+async fn dispatch_session(
+    state: &AppState,
+    raw: Bytes,
+    path: &'static str,
+    session: Option<&str>,
+) -> Response {
     let mut v: serde_json::Value = match serde_json::from_slice(&raw) {
         Ok(v) => v,
         Err(e) => return json_error(StatusCode::BAD_REQUEST, &format!("bad json: {e}")),
@@ -332,18 +797,19 @@ pub async fn dispatch(state: &AppState, raw: Bytes, path: &'static str) -> Respo
         Ok(bytes) => Bytes::from(bytes),
         Err(e) => return json_error(StatusCode::BAD_REQUEST, &format!("bad json: {e}")),
     };
-    dispatch_routed(state, &routing, raw, path).await
+    dispatch_routed_session(state, &routing, raw, path, session).await
 }
 
 /// Dispatch an encoded worker body using a separate routing representation.
 ///
 /// Protocol adapters use this to attach router-only metadata without leaking
 /// private fields to OpenAI-compatible workers.
-pub(crate) async fn dispatch_routed(
+pub(crate) async fn dispatch_routed_session(
     state: &AppState,
     routing_request: &Value,
     raw: Bytes,
     path: &'static str,
+    session: Option<&str>,
 ) -> Response {
     let model = routing_request
         .get("model")
@@ -354,6 +820,13 @@ pub(crate) async fn dispatch_routed(
         .and_then(|b| b.as_bool())
         .unwrap_or(false);
 
+    // Exact ISL/OSL on streaming replies (mirrors Python --enable-sla-metrics).
+    let raw = if stream {
+        inject_stream_usage(raw)
+    } else {
+        raw
+    };
+
     let guard = state.pool.load();
     let snap: &Snapshot = &guard;
 
@@ -363,8 +836,17 @@ pub(crate) async fn dispatch_routed(
     let has_p = !prefill.is_empty();
     let has_d = !decode.is_empty();
     if has_p && has_d {
-        return crate::disagg::dispatch(state, snap, model, routing_request, raw, stream, path)
-            .await;
+        return crate::disagg::dispatch(
+            state,
+            snap,
+            model,
+            routing_request,
+            raw,
+            stream,
+            path,
+            session,
+        )
+        .await;
     }
     if has_p != has_d && mixed.is_empty() {
         let (present, missing, count) = if has_p {
@@ -386,9 +868,36 @@ pub(crate) async fn dispatch_routed(
             &format!("no active worker for model={model:?}"),
         );
     }
-    mixed_dispatch(state, snap, model, routing_request, raw, stream, path).await
+    mixed_dispatch(
+        state,
+        snap,
+        model,
+        routing_request,
+        raw,
+        stream,
+        path,
+        session,
+    )
+    .await
 }
 
+fn inject_stream_usage(raw: Bytes) -> Bytes {
+    let Ok(mut v) = serde_json::from_slice::<Value>(&raw) else {
+        return raw;
+    };
+    let opts = v
+        .as_object_mut()
+        .map(|o| o.entry("stream_options").or_insert_with(|| json!({})));
+    if let Some(serde_json::Value::Object(map)) = opts {
+        map.insert("include_usage".into(), json!(true));
+    }
+    match serde_json::to_vec(&v) {
+        Ok(bytes) => Bytes::from(bytes),
+        Err(_) => raw,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn mixed_dispatch(
     state: &AppState,
     snap: &Snapshot,
@@ -397,17 +906,25 @@ async fn mixed_dispatch(
     raw: Bytes,
     stream: bool,
     path: &str,
+    session: Option<&str>,
 ) -> Response {
     let candidates = snap.list_active(model, DisaggMode::Mixed);
     if candidates.is_empty() {
+        let mut t = crate::metrics::RequestTracker::start("mixed", model);
+        t.set_outcome("error");
+        t.finish();
         return json_error(
             StatusCode::SERVICE_UNAVAILABLE,
             &format!("no active mixed worker for model={model:?}"),
         );
     }
 
+    // One tracker for the request. Failed attempts return it so the recorded
+    // duration includes every try, and the final outcome matches the last status.
+    let mut tracker = Some(crate::metrics::RequestTracker::start("mixed", model));
     let mut tried: HashSet<String> = HashSet::new();
     let mut last_err: Option<Response> = None;
+    let tokens = RequestTokens::default();
     for _ in 0..(1 + state.retries) {
         let avail: Vec<_> = candidates
             .iter()
@@ -421,26 +938,58 @@ async fn mixed_dispatch(
         // when every candidate is open — a request served by a probably-bad
         // worker beats turning a partial outage into a 503.
         let avail = state.breaker.filter(&avail, |w| w.worker_id.as_str());
-        let pick = state.policy.pick(&avail, request, Role::Mixed);
+        let (pick, lease) = state.sessions.pick(
+            state.policy.as_ref(),
+            &avail,
+            request,
+            &tokens,
+            Role::Mixed,
+            model,
+            session,
+        );
         tried.insert(pick.target.worker.worker_id.clone());
         // Load guard: started here, dropped when this attempt fails (fail-over)
         // or — on success — when the response body is fully sent.
         let guard = ActiveGuard::start(
             state.policy.clone(),
             vec![(pick.target.route_key(), pick.blocks.clone())],
-        );
+        )
+        .with_sessions(None, lease);
+        let bindings = guard.session_bindings();
         let wid = pick.target.worker.worker_id.clone();
-        match attempt(state, &pick.target, &raw, stream, path, guard).await {
+        if let Some(t) = tracker.as_mut() {
+            t.set_workers(&wid, &wid);
+        }
+        match attempt(
+            state,
+            &pick.target,
+            &raw,
+            stream,
+            path,
+            guard,
+            tracker.take(),
+        )
+        .await
+        {
             Ok(resp) => {
+                if !resp.status().is_success() {
+                    for binding in &bindings {
+                        binding.invalidate();
+                    }
+                }
                 state.breaker.record_success(&wid);
                 return resp;
             }
-            Err(err_resp) => {
+            Err(failed) => {
+                for binding in bindings {
+                    binding.invalidate();
+                }
                 // `attempt` only returns Err before any byte reached the client,
                 // so a mid-stream failure can never trip the breaker. 4xx is
                 // failed over but not held against the worker — see
                 // is_worker_fault().
-                if is_worker_fault(err_resp.status().as_u16()) {
+                tracker = failed.tracker;
+                if is_worker_fault(failed.response.status().as_u16()) {
                     state.breaker.record_failure(&wid);
                 } else {
                     // A 4xx is not held against the worker, but the probe slot
@@ -448,9 +997,18 @@ async fn mixed_dispatch(
                     // recovering worker out of rotation.
                     state.breaker.record_neutral(&wid);
                 }
-                last_err = Some(*err_resp);
+                last_err = Some(failed.response);
             }
         }
+    }
+    if let Some(mut t) = tracker {
+        let outcome = match last_err.as_ref().map(|resp| resp.status()) {
+            Some(status) if status.is_client_error() => "4xx",
+            Some(status) if status.is_server_error() => "5xx",
+            _ => "error",
+        };
+        t.set_outcome(outcome);
+        t.finish();
     }
     last_err.unwrap_or_else(|| json_error(StatusCode::SERVICE_UNAVAILABLE, "all workers failed"))
 }
@@ -468,6 +1026,7 @@ async fn attempt(
     stream: bool,
     path: &str,
     guard: ActiveGuard,
+    mut tracker: Option<crate::metrics::RequestTracker>,
 ) -> AttemptResult {
     let worker = &target.worker;
     // Per worker, not per router: a worker whose NATS consumer failed to start
@@ -475,57 +1034,82 @@ async fn attempt(
     // otherwise NATS.
     if worker.request_transport == "nats" {
         if let Some(nats) = state.nats.clone() {
-            return attempt_nats(&nats, target, raw, stream, path, guard).await;
+            return attempt_nats(
+                &nats,
+                target,
+                raw,
+                stream,
+                path,
+                state.stream_stall_warn,
+                guard,
+                tracker,
+            )
+            .await;
         }
-        return Err(Box::new(json_error(
-            StatusCode::BAD_GATEWAY,
-            &format!(
-                "worker {} registered the nats transport but this router has none",
-                worker.worker_id
+        return fail(
+            tracker,
+            json_error(
+                StatusCode::BAD_GATEWAY,
+                &format!(
+                    "worker {} registered the nats transport but this router has none",
+                    worker.worker_id
+                ),
             ),
-        )));
+        );
     }
     let url = format!("{}{}", worker.url, path);
     let mut req = state
         .http
         .post(&url)
         .header(header::CONTENT_TYPE, "application/json")
-        .body(raw.clone());
-    if let Some(r) = target.dp_rank {
+        .body(dp::with_body_rank(raw, target));
+    if let Some(r) = dp::header_rank(target) {
         req = req.header(dp::DP_RANK_HEADER, r.to_string());
     }
 
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
-            return Err(Box::new(json_error(
-                StatusCode::BAD_GATEWAY,
-                &format!("worker {} unreachable: {e}", worker.worker_id),
-            )))
+            return fail(
+                tracker,
+                json_error(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("worker {} unreachable: {e}", worker.worker_id),
+                ),
+            );
         }
     };
 
     let status = resp.status();
     if status.is_client_error() || status.is_server_error() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(Box::new(json_error(
-            status,
-            &format!(
-                "worker {} error {}: {}",
-                worker.worker_id,
-                status.as_u16(),
-                truncate_chars(&body, 500)
+        return fail(
+            tracker,
+            json_error(
+                status,
+                &format!(
+                    "worker {} error {}: {}",
+                    worker.worker_id,
+                    status.as_u16(),
+                    truncate_chars(&body, 500)
+                ),
             ),
-        )));
+        );
     }
 
     if stream {
-        Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .body(Body::from_stream(GuardedStream::new(
+        Ok(sse_response()
+            .body(Body::from_stream(GuardedStream::new_with_incomplete_abort(
                 resp.bytes_stream(),
                 guard,
+                StreamSource {
+                    path: path.to_string(),
+                    worker_id: worker.worker_id.clone(),
+                    request_id: String::new(),
+                    stall_warn: state.stream_stall_warn,
+                },
+                None,
+                tracker,
             )))
             .expect("stream response is valid"))
     } else {
@@ -537,15 +1121,458 @@ async fn attempt(
             .unwrap_or("application/json")
             .to_string();
         match resp.bytes().await {
-            Ok(bytes) => Ok(Response::builder()
-                .status(status)
-                .header(header::CONTENT_TYPE, ct)
-                .body(Body::from(bytes))
-                .expect("unary response is valid")),
-            Err(e) => Err(Box::new(json_error(
-                StatusCode::BAD_GATEWAY,
-                &format!("worker {} read failed: {e}", worker.worker_id),
-            ))),
+            Ok(bytes) => {
+                if let Some(mut t) = tracker.take() {
+                    if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+                        if let Some(usage) = v.get("usage") {
+                            if let Some(p) = usage.get("prompt_tokens").and_then(|x| x.as_u64()) {
+                                t.set_input_tokens(p);
+                            }
+                            if let Some(c) = usage.get("completion_tokens").and_then(|x| x.as_u64())
+                            {
+                                t.set_output_tokens(c);
+                            }
+                        }
+                    }
+                    t.set_outcome("ok");
+                    t.finish();
+                }
+                Ok(Response::builder()
+                    .status(status)
+                    .header(header::CONTENT_TYPE, ct)
+                    .body(Body::from(bytes))
+                    .expect("unary response is valid"))
+            }
+            Err(e) => fail(
+                tracker,
+                json_error(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("worker {} read failed: {e}", worker.worker_id),
+                ),
+            ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::RoundRobin;
+    use futures::StreamExt;
+
+    fn guard() -> ActiveGuard {
+        ActiveGuard::start(Arc::new(RoundRobin::new()), Vec::new())
+    }
+
+    fn source(path: &str) -> StreamSource {
+        StreamSource {
+            path: path.to_string(),
+            worker_id: "w1".to_string(),
+            request_id: "infera-1".to_string(),
+            stall_warn: StallWarn::default(),
+        }
+    }
+
+    /// Collects the formatted log output of one scope.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the capture buffer")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn sse(chunks: &[&'static str]) -> impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static {
+        let items: Vec<reqwest::Result<Bytes>> = chunks
+            .iter()
+            .map(|c| Ok(Bytes::from_static(c.as_bytes())))
+            .collect();
+        futures::stream::iter(items)
+    }
+
+    /// Drain a guarded PD stream and report what it told the abort watcher.
+    async fn end_of(chunks: &[&'static str]) -> StreamEnd {
+        let (tx, rx) = oneshot::channel();
+        let mut stream = GuardedStream::new_with_incomplete_abort(
+            sse(chunks),
+            guard(),
+            source("/v1/chat/completions"),
+            Some(tx),
+            None,
+        );
+        while stream.next().await.is_some() {}
+        drop(stream);
+        rx.await.expect("the guarded stream reports its end")
+    }
+
+    async fn responses_end_of(chunks: &[&'static str]) -> StreamEnd {
+        let (tx, rx) = oneshot::channel();
+        let mut stream = GuardedStream::new_with_incomplete_abort(
+            sse(chunks),
+            guard(),
+            source("/v1/responses"),
+            Some(tx),
+            None,
+        );
+        while stream.next().await.is_some() {}
+        drop(stream);
+        rx.await.expect("the guarded stream reports its end")
+    }
+
+    #[tokio::test]
+    async fn a_terminated_sse_stream_completes() {
+        assert_eq!(
+            end_of(&["data: {\"x\":1}\n\n", "data: [DONE]\n\n"]).await,
+            StreamEnd::Complete
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upstream_eof_without_the_terminator_is_incomplete() {
+        // The decode leg closed mid-generation. The byte stream ended without
+        // an error, so only the missing terminator separates this from a
+        // finished request -- and the prefill leg still has to be aborted.
+        assert_eq!(
+            end_of(&["data: {\"x\":1}\n\n"]).await,
+            StreamEnd::Incomplete
+        );
+    }
+
+    #[tokio::test]
+    async fn a_terminator_split_across_chunks_still_completes() {
+        assert_eq!(
+            end_of(&["data: {\"x\":1}\n\ndata: [DO", "NE]\n\n"]).await,
+            StreamEnd::Complete
+        );
+    }
+
+    #[tokio::test]
+    async fn a_responses_terminator_split_across_chunks_still_completes() {
+        assert_eq!(
+            responses_end_of(&[
+                "event: response.cre",
+                "ated\ndata: {}\n\nevent: response.com",
+                "pleted\ndata: {}\n\n"
+            ])
+            .await,
+            StreamEnd::Complete
+        );
+    }
+
+    #[tokio::test]
+    async fn a_truncated_terminator_is_incomplete() {
+        assert_eq!(end_of(&["data: [DON"]).await, StreamEnd::Incomplete);
+    }
+
+    #[tokio::test]
+    async fn a_terminator_lookalike_does_not_complete() {
+        // A generated token may spell the sentinel; only the SSE field does.
+        assert_eq!(
+            end_of(&["data: {\"content\":\"[DONE]\"}\n\n"]).await,
+            StreamEnd::Incomplete
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restarted_match_still_finds_the_terminator() {
+        // The first attempt fails nine bytes in and the real marker begins at
+        // the byte that broke it, so a matcher that only ever moves forward
+        // would miss it.
+        assert_eq!(
+            end_of(&["data: [DOdata: [DON", "E]\n\n"]).await,
+            StreamEnd::Complete
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_without_an_abort_watcher_completes_on_eof() {
+        // Mixed (non-PD) traffic has no pair to abort, so EOF stays completion.
+        let mut stream = GuardedStream::new(sse(&["data: {\"x\":1}\n\n"]), guard(), source(""));
+        while stream.next().await.is_some() {}
+        assert!(stream.completed);
+    }
+
+    /// A stall or reset lands mid-body, where the only thing the client gets is
+    /// an in-stream error. Without this log line the router keeps no record of
+    /// which worker went quiet on which request, which is the whole reason a
+    /// stalled stream can only be diagnosed from the caller's own timeout.
+    #[tokio::test]
+    async fn a_mid_body_failure_names_the_worker_and_the_request() {
+        let items: Vec<reqwest::Result<Bytes>> = vec![
+            Ok(Bytes::from_static(b"data: {\"x\":1}\n\n")),
+            Err(transport_error().await),
+        ];
+        let logs = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut stream = GuardedStream::new(
+                futures::stream::iter(items),
+                guard(),
+                source("/v1/messages"),
+            );
+            futures::executor::block_on(async { while stream.next().await.is_some() {} });
+        });
+
+        let out = String::from_utf8(logs.0.lock().expect("the capture buffer").clone())
+            .expect("the log is utf-8");
+        assert!(out.contains("worker stream failed mid-body"), "{out}");
+        assert!(out.contains("w1"), "{out}");
+        assert!(out.contains("infera-1"), "{out}");
+        assert!(out.contains("/v1/messages"), "{out}");
+    }
+
+    /// A caller that has not given up is still owed its answer, so a stall is
+    /// reported and then waited out. Ending it here would fail requests that
+    /// are only slow to be admitted, and a caller that does give up
+    /// disconnects, which reclaims the slot without this deciding for it.
+    ///
+    /// Driven entirely by the runtime: the stream parks on `Pending` and only
+    /// the stall timer can wake it again, so a report that fails to re-register
+    /// its waker lands once and the later deadlines never arrive. Polling by
+    /// hand between clock advances would supply that wakeup and hide it.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_stream_keeps_reporting_and_never_ends() {
+        let logs = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+
+        let captured = logs.clone();
+        // Attached to the future rather than the thread: the awaits below have
+        // to stay on the tokio runtime, which is what drives the stall timer.
+        tracing::instrument::WithSubscriber::with_subscriber(
+            async {
+                let mut src = source("/v1/messages");
+                src.stall_warn = StallWarn {
+                    before_first_byte: Duration::from_secs(240),
+                    mid_stream: Duration::from_secs(60),
+                };
+                // Never yields, so the admission window is the only thing that
+                // can ever wake this task.
+                let inner = futures::stream::pending::<reqwest::Result<Bytes>>();
+                let mut stream = GuardedStream::new(inner, guard(), src);
+
+                // A paused clock auto-advances to the next timer whenever the
+                // runtime is idle, so this drains four admission windows before
+                // the outer bound fires.
+                let ended = tokio::time::timeout(Duration::from_secs(1000), async {
+                    while stream.next().await.is_some() {}
+                })
+                .await;
+                assert!(ended.is_err(), "a stall must not end the stream");
+            },
+            subscriber,
+        )
+        .await;
+
+        let out = String::from_utf8(captured.0.lock().expect("the capture buffer").clone())
+            .expect("the log is utf-8");
+        assert!(out.contains("still waiting"), "{out}");
+        assert!(out.contains("awaiting first byte"), "{out}");
+        assert!(out.contains("infera-1"), "{out}");
+        for elapsed in [240, 480, 720, 960] {
+            assert!(
+                out.contains(&format!("silent_for_s={elapsed}")),
+                "missing the report at {elapsed}s: {out}"
+            );
+        }
+    }
+
+    /// Reporting is opt-in: a zero period arms no timer at all.
+    #[tokio::test(start_paused = true)]
+    async fn stall_reporting_is_off_when_the_period_is_zero() {
+        let logs = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let inner = futures::stream::pending::<reqwest::Result<Bytes>>();
+        let mut stream = GuardedStream::new(inner, guard(), source("/v1/messages"));
+        assert!(futures::poll!(stream.next()).is_pending());
+        tokio::time::advance(Duration::from_secs(600)).await;
+        assert!(futures::poll!(stream.next()).is_pending());
+
+        assert!(logs.0.lock().expect("the capture buffer").is_empty());
+    }
+
+    /// A transport error, built without opening a socket: reqwest rejects the
+    /// scheme before it dials.
+    async fn transport_error() -> reqwest::Error {
+        reqwest::Client::new()
+            .get("ftp://127.0.0.1/")
+            .send()
+            .await
+            .expect_err("reqwest refuses a non-http scheme")
+    }
+
+    #[tokio::test]
+    async fn a_delivered_terminator_completes_a_dropped_stream() {
+        // The client holds the whole answer once `data: [DONE]` reaches it and
+        // may drop the body there, never polling the stream to EOF. Reading
+        // that as incomplete would abort a request that already succeeded.
+        let (tx, rx) = oneshot::channel();
+        let mut stream = GuardedStream::new_with_incomplete_abort(
+            sse(&["data: {\"x\":1}\n\n", "data: [DONE]\n\n"]),
+            guard(),
+            source("/v1/chat/completions"),
+            Some(tx),
+            None,
+        );
+        stream
+            .next()
+            .await
+            .expect("the first chunk")
+            .expect("a chunk");
+        stream
+            .next()
+            .await
+            .expect("the terminal chunk")
+            .expect("a chunk");
+        drop(stream);
+        assert_eq!(
+            rx.await.expect("the guarded stream reports its end"),
+            StreamEnd::Complete
+        );
+    }
+
+    #[tokio::test]
+    async fn an_error_after_the_terminator_is_incomplete() {
+        // The terminator was seen, but the body then broke before the client
+        // could read it out, so the pair still has to be aborted.
+        let (tx, rx) = oneshot::channel();
+        let items: Vec<reqwest::Result<Bytes>> = vec![
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+            Err(transport_error().await),
+        ];
+        let mut stream = GuardedStream::new_with_incomplete_abort(
+            futures::stream::iter(items),
+            guard(),
+            source("/v1/chat/completions"),
+            Some(tx),
+            None,
+        );
+        stream
+            .next()
+            .await
+            .expect("the terminal chunk")
+            .expect("a chunk");
+        stream
+            .next()
+            .await
+            .expect("the failure")
+            .expect_err("a transport error");
+        drop(stream);
+        assert_eq!(
+            rx.await.expect("the guarded stream reports its end"),
+            StreamEnd::Incomplete
+        );
+    }
+
+    fn nats_sse(
+        chunks: &[&'static str],
+    ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
+        let items: Vec<Result<Bytes, std::io::Error>> = chunks
+            .iter()
+            .map(|c| Ok(Bytes::from_static(c.as_bytes())))
+            .collect();
+        futures::stream::iter(items)
+    }
+
+    #[tokio::test]
+    async fn a_delivered_terminator_completes_a_dropped_nats_body() {
+        // Same race on the NATS PD leg: the client can drop the body between
+        // the terminal bytes and the `Frame::Done` that ends the stream.
+        let (tx, rx) = oneshot::channel();
+        let mut body = guarded_with_incomplete_abort(
+            nats_sse(&["event: response.completed\ndata: {}\n\n"]),
+            guard(),
+            source("/v1/responses"),
+            Some(tx),
+            None,
+        );
+        body.next()
+            .await
+            .expect("the terminal chunk")
+            .expect("a chunk");
+        drop(body);
+        assert_eq!(
+            rx.await.expect("the guarded body reports its end"),
+            StreamEnd::Complete
+        );
+    }
+
+    #[tokio::test]
+    async fn a_nats_error_after_the_terminator_is_incomplete() {
+        // `Frame::Done` with a 5xx, or a missing done frame, surfaces as an
+        // error item after the terminal bytes; it still means incomplete.
+        let (tx, rx) = oneshot::channel();
+        let items: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+            Err(std::io::Error::other("decode NATS stream ended with 503")),
+        ];
+        let mut body = guarded_with_incomplete_abort(
+            futures::stream::iter(items),
+            guard(),
+            source("/v1/chat/completions"),
+            Some(tx),
+            None,
+        );
+        body.next()
+            .await
+            .expect("the terminal chunk")
+            .expect("a chunk");
+        body.next()
+            .await
+            .expect("the failure")
+            .expect_err("a stream error");
+        drop(body);
+        assert_eq!(
+            rx.await.expect("the guarded body reports its end"),
+            StreamEnd::Incomplete
+        );
+    }
+
+    #[tokio::test]
+    async fn a_nats_body_without_a_terminator_still_completes_on_eof() {
+        // NATS carries its own terminator: a clean `Frame::Done` ends the
+        // stream, so EOF stays completion even with no marker in the bytes.
+        let (tx, rx) = oneshot::channel();
+        let mut body = guarded_with_incomplete_abort(
+            nats_sse(&["data: {\"x\":1}\n\n"]),
+            guard(),
+            source("/v1/chat/completions"),
+            Some(tx),
+            None,
+        );
+        while body.next().await.is_some() {}
+        drop(body);
+        assert_eq!(
+            rx.await.expect("the guarded body reports its end"),
+            StreamEnd::Complete
+        );
     }
 }

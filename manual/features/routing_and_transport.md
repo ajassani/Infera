@@ -40,6 +40,7 @@ digraph routing_transport {
 | KV-event transport | `--kv-event-transport` | `nats` \| `zmq` | `nats` |
 | Router mode (server) | `--router-mode` | `auto` \| `direct` | `auto` |
 | Router policy (server) | `--router-policy` | `kv-aware` \| `round-robin` | `kv-aware` |
+| Session affinity (server) | `--session-affinity` | `off` \| `prefill` \| `both` | `off` |
 
 ```{important}
 The defaults (**NATS + Kubernetes**) assume a reachable NATS broker and a k8s API
@@ -69,6 +70,19 @@ The defaults (**NATS + Kubernetes**) assume a reachable NATS broker and a k8s AP
   See [KV-aware routing](kv_aware_routing.md) for the cost function and the
   `--kv-overlap-weight` dial.
 
+**Session affinity (`--session-affinity`)** sits on top of either policy, on
+both router backends. A request with an `X-Session-ID` header goes to
+the target its session used last; the policy picks the first one and still
+scores the pinned one. `prefill` pins prefill picks only, `both` also pins
+decode and mixed picks, each role independently. Bindings are per model and
+per router process, dropped after `--session-affinity-ttl-seconds` idle
+(default `3600`), and re-picked when the target leaves the fleet. See
+[Deployment → session affinity](../serving/deployment.md#optional-session-affinity).
+
+The `X-Correlation-ID` and `X-Session-ID` headers are also forwarded to both PD
+legs (Python router backend), so an engine can keep a session on one DP rank
+(e.g. ATOM's `ATOM_DP_SESSION_AFFINITY`, which keys on `X-Correlation-ID`).
+
 **3. Topology** — mixed vs disaggregated is **automatic**: when PD workers exist,
 the `AutoRouter` prefers a prefill+decode pair and the `DisaggRouter` shapes the
 per-connector body (concurrent push or serial pull); otherwise it routes to a
@@ -97,7 +111,7 @@ When `--request-transport nats` (flag > env var > default):
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `--nats-req-idle-timeout` | `INFERA_NATS_REQ_IDLE_TIMEOUT` | `900`s | max wait for the *next* reply chunk (reset per chunk). Expiry → 504 + cancel. `0` = forever. |
+| `--nats-req-idle-timeout` | `INFERA_NATS_REQ_IDLE_TIMEOUT` | `900`s | max wait for the *next* reply chunk (reset per chunk). Expiry → 504 + cancel. A backstop: this transport has no connection to lose when a worker dies mid-stream. |
 | `--nats-req-max-duration` | `INFERA_NATS_REQ_MAX_DURATION` | `0` (off) | hard wall-clock cap on the whole request. Expiry → 504 + cancel. |
 | `--nats-req-max-pending` | `INFERA_NATS_REQ_MAX_PENDING` | `0` (off) | per-worker admission limit; backlog at the cap → **429**. |
 
@@ -198,6 +212,9 @@ worker**.
 |---|---|---|
 | `NATS_SERVER` / `NATS_URL` | *(operator-injected)* | NATS broker address when `--request-transport nats`. |
 | `INFERA_NATS_REQ_IDLE_TIMEOUT` | `900` (s) | Max wait for the next reply chunk; expiry → 504 + cancel. |
+| `INFERA_HTTP_REQ_IDLE_TIMEOUT` | `0` (off) | Same, for `--request-transport http`; expiry fails the stream. |
+| `INFERA_STREAM_ADMISSION_WARN` | `240` (s) | Log a stream still awaiting its first byte. Reports only; never ends it. |
+| `INFERA_STREAM_STALL_WARN` | `60` (s) | Log a stream that has gone silent after producing bytes. Reports only. |
 | `INFERA_NATS_REQ_MAX_DURATION` | `0` (off) | Hard wall-clock cap on a whole request. |
 | `INFERA_NATS_REQ_MAX_PENDING` | `0` (off) | Per-worker admission limit; backlog at the cap → 429. |
 | `INFERA_REQUEST_MAX_RETRIES` | `1` | Retry on an alternate worker before the first token. `0` = fail fast. |
